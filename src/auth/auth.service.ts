@@ -21,6 +21,24 @@ import {
 @Injectable()
 export class AuthService {
   private googleClient: OAuth2Client;
+  
+  // Map temporal para almacenar datos de registro
+  private tempRegistrations = new Map<string, {
+    nombreCompleto: string;
+    correoElectronico: string;
+    telefono: string;
+    contrasena: string;
+    verificationCode: number;
+    createdAt: number;
+  }>();
+
+  // Map para recuperación de contraseña
+  private passwordRecovery = new Map<string, {
+    userId: number;
+    recoveryCode: number;
+    createdAt: number;
+    verified: boolean;
+  }>();
 
   constructor(
     private readonly usersService: UsersService,
@@ -33,32 +51,30 @@ export class AuthService {
     );
   }
 
+
   async register(registerDto: RegisterDto, session: any) {
     const { nombreCompleto, correoElectronico, telefono, contrasena } = registerDto;
 
-    // Verificar si el correo ya está registrado
     const existingUser = await this.usersService.findByEmail(correoElectronico);
     if (existingUser) {
       throw new BadRequestException('El correo electrónico ya está registrado');
     }
 
-    // Cifrar la contraseña
     const hashedPassword = await bcrypt.hash(contrasena, 10);
-
-    // Generar código de verificación
     const verificationCode = Math.floor(100000 + Math.random() * 900000);
 
-    // Guardar en sesión
-    session.tempUserData = {
+    this.tempRegistrations.set(correoElectronico, {
       nombreCompleto,
       correoElectronico,
       telefono,
       contrasena: hashedPassword,
       verificationCode,
       createdAt: Date.now(),
-    };
+    });
 
-    // Enviar email
+    console.log('Registro guardado:', correoElectronico, '- Código:', verificationCode);
+    this.cleanOldRegistrations();
+
     await this.emailService.sendVerificationEmail(
       correoElectronico,
       nombreCompleto,
@@ -70,36 +86,32 @@ export class AuthService {
     };
   }
 
-  async verifyEmail(code: string, session: any) {
-    const tempUserData = session.tempUserData;
+  async verifyEmail(code: string, correoElectronico: string) {
+    console.log('🔍 Verificando:', correoElectronico);
+    
+    const tempUserData = this.tempRegistrations.get(correoElectronico);
 
     if (!tempUserData) {
-      throw new BadRequestException('No hay sesión activa para verificar');
+      console.error('❌ No se encontró registro para:', correoElectronico);
+      throw new BadRequestException('No hay registro pendiente de verificación');
     }
 
-    // Verificar expiración (4 minutos)
     const EXPIRATION_TIME = 4 * 60 * 1000;
     if (Date.now() - tempUserData.createdAt > EXPIRATION_TIME) {
-      delete session.tempUserData;
+      this.tempRegistrations.delete(correoElectronico);
       throw new BadRequestException('El código de verificación ha expirado');
     }
 
-    // Verificar código
     if (parseInt(code) !== tempUserData.verificationCode) {
       throw new BadRequestException('Código incorrecto');
     }
 
-    // Verificar nuevamente que el email no se haya registrado
-    const existing = await this.usersService.findByEmail(
-      tempUserData.correoElectronico,
-    );
-
+    const existing = await this.usersService.findByEmail(correoElectronico);
     if (existing) {
-      delete session.tempUserData;
+      this.tempRegistrations.delete(correoElectronico);
       throw new BadRequestException('El correo ya está registrado');
     }
 
-    // Crear el usuario usando el método existente
     const newUser = await this.usersService.create({
       nombreCompleto: tempUserData.nombreCompleto,
       correoElectronico: tempUserData.correoElectronico,
@@ -107,8 +119,7 @@ export class AuthService {
       contrasena: tempUserData.contrasena,
     });
 
-    // Limpiar sesión
-    delete session.tempUserData;
+    this.tempRegistrations.delete(correoElectronico);
 
     return {
       message: 'Correo verificado exitosamente. Tu cuenta ha sido creada.',
@@ -120,25 +131,25 @@ export class AuthService {
     };
   }
 
-  async resendCode(session: any) {
-    const tempUserData = session.tempUserData;
+  async resendCode(correoElectronico: string) {
+    const tempUserData = this.tempRegistrations.get(correoElectronico);
 
     if (!tempUserData) {
-      throw new BadRequestException(
-        'No hay registro pendiente de verificación',
-      );
+      throw new BadRequestException('No hay registro pendiente de verificación');
     }
 
-    // Generar nuevo código
     const verificationCode = Math.floor(100000 + Math.random() * 900000);
 
-    // Actualizar sesión
-    session.tempUserData.verificationCode = verificationCode;
-    session.tempUserData.createdAt = Date.now();
+    this.tempRegistrations.set(correoElectronico, {
+      ...tempUserData,
+      verificationCode,
+      createdAt: Date.now(),
+    });
 
-    // Enviar email
+    console.log('🔄 Código reenviado:', correoElectronico, '- Nuevo código:', verificationCode);
+
     await this.emailService.sendVerificationEmail(
-      tempUserData.correoElectronico,
+      correoElectronico,
       tempUserData.nombreCompleto,
       verificationCode,
     );
@@ -146,35 +157,40 @@ export class AuthService {
     return { message: 'Nuevo código enviado. Revisa tu correo.' };
   }
 
+  private cleanOldRegistrations() {
+    const TEN_MINUTES = 10 * 60 * 1000;
+    const now = Date.now();
+
+    for (const [email, data] of this.tempRegistrations.entries()) {
+      if (now - data.createdAt > TEN_MINUTES) {
+        this.tempRegistrations.delete(email);
+      }
+    }
+  }
+
+  // ========== LOGIN ==========
   async login(loginDto: LoginDto, session: any) {
     const { correoElectronico, contrasena } = loginDto;
 
-    // Buscar usuario
     const user = await this.usersService.findByEmail(correoElectronico);
-
     if (!user) {
       throw new UnauthorizedException('Credenciales incorrectas');
     }
 
-    // Validar contraseña usando el método del servicio
-    const isMatch = await this.usersService.validatePassword(
-      contrasena,
-      user.contrasena,
-    );
-
+    const isMatch = await this.usersService.validatePassword(contrasena, user.contrasena);
     if (!isMatch) {
       throw new UnauthorizedException('Credenciales incorrectas');
     }
 
-    // Generar token
     const token = this.createToken(user);
 
-    // Guardar sesión
-    session.user = {
-      id: user.id,
-      nombreCompleto: user.nombreCompleto,
-      correoElectronico: user.correoElectronico,
-    };
+    if (session) {
+      session.user = {
+        id: user.id,
+        nombreCompleto: user.nombreCompleto,
+        correoElectronico: user.correoElectronico,
+      };
+    }
 
     return {
       message: 'Inicio de sesión exitoso',
@@ -187,11 +203,11 @@ export class AuthService {
     };
   }
 
+  // ========== LOGIN CON GOOGLE ==========
   async googleAuth(googleAuthDto: GoogleAuthDto, session: any) {
     const { googleToken } = googleAuthDto;
 
     try {
-      // Verificar token de Google
       const ticket = await this.googleClient.verifyIdToken({
         idToken: googleToken,
         audience: this.configService.get('GOOGLE_CLIENT_ID'),
@@ -205,11 +221,9 @@ export class AuthService {
 
       const { email, name, sub } = payload;
 
-      // Buscar usuario existente
       let user = await this.usersService.findByEmail(email);
 
       if (!user) {
-        // Crear nuevo usuario
         const hashedPassword = await bcrypt.hash(sub, 10);
         user = await this.usersService.create({
           nombreCompleto: name || 'Usuario',
@@ -219,15 +233,15 @@ export class AuthService {
         });
       }
 
-      // Generar token
       const token = this.createToken(user);
 
-      // Guardar sesión
-      session.user = {
-        id: user.id,
-        nombreCompleto: user.nombreCompleto,
-        correoElectronico: user.correoElectronico,
-      };
+      if (session) {
+        session.user = {
+          id: user.id,
+          nombreCompleto: user.nombreCompleto,
+          correoElectronico: user.correoElectronico,
+        };
+      }
 
       return {
         message: 'Inicio de sesión con Google exitoso',
@@ -243,29 +257,26 @@ export class AuthService {
     }
   }
 
-  async forgotPassword(forgotPasswordDto: ForgotPasswordDto, session: any) {
+  // ========== RECUPERACIÓN DE CONTRASEÑA ==========
+  async forgotPassword(forgotPasswordDto: ForgotPasswordDto) {
     const { correoElectronico } = forgotPasswordDto;
 
-    // Buscar usuario
     const user = await this.usersService.findByEmail(correoElectronico);
-
     if (!user) {
       throw new NotFoundException('No existe una cuenta con ese correo');
     }
 
-    // Generar código
     const recoveryCode = Math.floor(100000 + Math.random() * 900000);
 
-    // Guardar en sesión
-    session.passwordRecovery = {
-      correoElectronico,
+    this.passwordRecovery.set(correoElectronico, {
       userId: user.id,
       recoveryCode,
       createdAt: Date.now(),
       verified: false,
-    };
+    });
 
-    // Enviar email
+    console.log('🔑 Código de recuperación generado:', correoElectronico, '- Código:', recoveryCode);
+
     await this.emailService.sendPasswordRecoveryEmail(
       correoElectronico,
       user.nombreCompleto,
@@ -275,107 +286,94 @@ export class AuthService {
     return { message: 'Código de recuperación enviado. Revisa tu correo.' };
   }
 
-  async verifyRecoveryCode(code: string, session: any) {
-    const passwordRecovery = session.passwordRecovery;
+  async verifyRecoveryCode(code: string, correoElectronico: string) {
+    const recovery = this.passwordRecovery.get(correoElectronico);
 
-    if (!passwordRecovery) {
-      throw new BadRequestException(
-        'No hay solicitud de recuperación activa',
-      );
+    if (!recovery) {
+      throw new BadRequestException('No hay solicitud de recuperación activa');
     }
 
-    // Verificar expiración (10 minutos)
     const EXPIRATION_TIME = 10 * 60 * 1000;
-    if (Date.now() - passwordRecovery.createdAt > EXPIRATION_TIME) {
-      delete session.passwordRecovery;
+    if (Date.now() - recovery.createdAt > EXPIRATION_TIME) {
+      this.passwordRecovery.delete(correoElectronico);
       throw new BadRequestException('El código de recuperación ha expirado');
     }
 
-    if (parseInt(code) !== passwordRecovery.recoveryCode) {
+    if (parseInt(code) !== recovery.recoveryCode) {
       throw new BadRequestException('Código incorrecto');
     }
 
-    // Marcar como verificado
-    session.passwordRecovery.verified = true;
+    this.passwordRecovery.set(correoElectronico, {
+      ...recovery,
+      verified: true,
+    });
 
     return { message: 'Código verificado correctamente' };
   }
 
-  async resetPassword(resetPasswordDto: ResetPasswordDto, session: any) {
+  async resetPassword(resetPasswordDto: ResetPasswordDto, correoElectronico: string) {
     const { newPassword } = resetPasswordDto;
-    const passwordRecovery = session.passwordRecovery;
+    const recovery = this.passwordRecovery.get(correoElectronico);
 
-    if (!passwordRecovery) {
-      throw new BadRequestException(
-        'No hay solicitud de recuperación activa',
-      );
+    if (!recovery) {
+      throw new BadRequestException('No hay solicitud de recuperación activa');
     }
 
-    if (!passwordRecovery.verified) {
+    if (!recovery.verified) {
       throw new BadRequestException('Debes verificar el código primero');
     }
 
-    // Verificar expiración
     const EXPIRATION_TIME = 10 * 60 * 1000;
-    if (Date.now() - passwordRecovery.createdAt > EXPIRATION_TIME) {
-      delete session.passwordRecovery;
+    if (Date.now() - recovery.createdAt > EXPIRATION_TIME) {
+      this.passwordRecovery.delete(correoElectronico);
       throw new BadRequestException('La sesión ha expirado');
     }
 
-    // Hash de nueva contraseña
     const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-    // Actualizar en BD usando el método del servicio
-    await this.usersService.update(passwordRecovery.userId, {
+    await this.usersService.update(recovery.userId, {
       contrasena: hashedPassword,
     });
 
-    // Obtener usuario para enviar email
-    const user = await this.usersService.findOne(passwordRecovery.userId);
-
+    const user = await this.usersService.findOne(recovery.userId);
     if (!user) {
       throw new NotFoundException('Usuario no encontrado');
     }
 
-    // Enviar email de confirmación
     await this.emailService.sendPasswordChangedEmail(
-      passwordRecovery.correoElectronico,
+      correoElectronico,
       user.nombreCompleto,
     );
 
-    // Limpiar sesión
-    delete session.passwordRecovery;
+    this.passwordRecovery.delete(correoElectronico);
 
     return { message: 'Contraseña actualizada exitosamente' };
   }
 
-  async resendRecoveryCode(session: any) {
-    const passwordRecovery = session.passwordRecovery;
+  async resendRecoveryCode(correoElectronico: string) {
+    const recovery = this.passwordRecovery.get(correoElectronico);
 
-    if (!passwordRecovery) {
-      throw new BadRequestException(
-        'No hay solicitud de recuperación activa',
-      );
+    if (!recovery) {
+      throw new BadRequestException('No hay solicitud de recuperación activa');
     }
 
-    // Generar nuevo código
     const recoveryCode = Math.floor(100000 + Math.random() * 900000);
 
-    // Actualizar sesión
-    session.passwordRecovery.recoveryCode = recoveryCode;
-    session.passwordRecovery.createdAt = Date.now();
-    session.passwordRecovery.verified = false;
+    this.passwordRecovery.set(correoElectronico, {
+      ...recovery,
+      recoveryCode,
+      createdAt: Date.now(),
+      verified: false,
+    });
 
-    // Obtener usuario
-    const user = await this.usersService.findOne(passwordRecovery.userId);
+    console.log('🔄 Código de recuperación reenviado:', correoElectronico, '- Nuevo código:', recoveryCode);
 
+    const user = await this.usersService.findOne(recovery.userId);
     if (!user) {
       throw new NotFoundException('Usuario no encontrado');
     }
 
-    // Enviar email
     await this.emailService.sendPasswordRecoveryEmail(
-      passwordRecovery.correoElectronico,
+      correoElectronico,
       user.nombreCompleto,
       recoveryCode,
     );
@@ -383,6 +381,7 @@ export class AuthService {
     return { message: 'Nuevo código enviado. Revisa tu correo.' };
   }
 
+  // ========== UTILIDADES ==========
   private createToken(user: any) {
     const payload = {
       sub: user.id,
