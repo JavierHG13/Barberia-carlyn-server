@@ -8,7 +8,7 @@ import { AppModule } from './app.module';
 
 async function bootstrap() {
   //const app = await NestFactory.create(AppModule);
-  const app = await NestFactory.create(AppModule, { logger: ['log', 'error', 'warn', 'debug', 'verbose'] });
+  const app = await NestFactory.create(AppModule);
 
   app.use(morgan('dev'));
 
@@ -20,7 +20,6 @@ async function bootstrap() {
       saveUninitialized: false,
       cookie: {
         maxAge: 3600000, // 1 hora
-        httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
       },
     }),
