@@ -48,7 +48,7 @@ export class AuthController {
     return this.authService.googleAuth(googleAuthDto, session);
   }
 
-  // 🔄 RECUPERACIÓN DE CONTRASEÑA
+  //RECUPERACIÓN DE CONTRASEÑA
   @Post('forgot-password')
   async forgotPassword(@Body() forgotPasswordDto: ForgotPasswordDto) {
     return this.authService.forgotPassword(forgotPasswordDto);
@@ -75,7 +75,7 @@ export class AuthController {
     return this.authService.resendRecoveryCode(body.correoElectronico);
   }
 
-  // 👤 PERFIL (RUTA PROTEGIDA)
+  // PERFIL (RUTA PROTEGIDA)
   @UseGuards(AuthGuard('jwt'))
   @Get('profile')
   getProfile(@Request() req) {

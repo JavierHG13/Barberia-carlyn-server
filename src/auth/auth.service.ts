@@ -92,7 +92,7 @@ export class AuthService {
     const tempUserData = this.tempRegistrations.get(correoElectronico);
 
     if (!tempUserData) {
-      console.error('❌ No se encontró registro para:', correoElectronico);
+      console.error('No se encontró registro para:', correoElectronico);
       throw new BadRequestException('No hay registro pendiente de verificación');
     }
 

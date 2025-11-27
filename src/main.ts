@@ -3,12 +3,20 @@ import { ConfigService } from '@nestjs/config';
 import { ValidationPipe } from '@nestjs/common';
 import session from 'express-session';
 import morgan from 'morgan';
+import * as fs from 'fs';
 
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  //const app = await NestFactory.create(AppModule);
-  const app = await NestFactory.create(AppModule);
+
+  const httpsOptions = {
+    key: fs.readFileSync('C:/mkcert/localhost-key.pem'),
+    cert: fs.readFileSync('C:/mkcert/localhost.pem'),
+  };
+
+  const app = await NestFactory.create(AppModule, {
+    httpsOptions,
+  });
 
   app.use(morgan('dev'));
 
@@ -31,7 +39,7 @@ async function bootstrap() {
     credentials: true,
   });
 
-  // Validación global
+
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
@@ -41,6 +49,6 @@ async function bootstrap() {
   );
 
   await app.listen(3000);
-  console.log('Servidor corriendo');
+  console.log('Servidor en https://localhost:3000');
 }
 bootstrap();
