@@ -3,6 +3,8 @@ import {
   BadRequestException,
   UnauthorizedException,
   NotFoundException,
+  HttpException,
+  HttpStatus,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
@@ -40,6 +42,12 @@ export class AuthService {
     verified: boolean;
   }>();
 
+  // Map para control de intentos fallidos de login
+  private loginAttempts = new Map<string, {
+    attempts: number;
+    blockedUntil: number | null;
+  }>();
+
   constructor(
     private readonly usersService: UsersService,
     private readonly jwtService: JwtService,
@@ -50,7 +58,6 @@ export class AuthService {
       this.configService.get('GOOGLE_CLIENT_ID'),
     );
   }
-
 
   async register(registerDto: RegisterDto, session: any) {
     const { nombreCompleto, correoElectronico, telefono, contrasena } = registerDto;
@@ -168,19 +175,68 @@ export class AuthService {
     }
   }
 
+  // ========== CONTROL DE INTENTOS FALLIDOS ==========
+  private checkIfBlocked(identifier: string): void {
+    const attemptData = this.loginAttempts.get(identifier);
+    
+    if (!attemptData) return;
+
+    if (attemptData.blockedUntil && Date.now() < attemptData.blockedUntil) {
+      const remainingTime = Math.ceil((attemptData.blockedUntil - Date.now()) / 1000);
+      throw new HttpException(
+        `Demasiados intentos fallidos. Intenta de nuevo en ${remainingTime} segundos`,
+        HttpStatus.TOO_MANY_REQUESTS
+      );
+    }
+
+    // Si el bloqueo ya expiró, reiniciar
+    if (attemptData.blockedUntil && Date.now() >= attemptData.blockedUntil) {
+      this.loginAttempts.delete(identifier);
+    }
+  }
+
+  private recordFailedAttempt(identifier: string): void {
+    const attemptData = this.loginAttempts.get(identifier) || {
+      attempts: 0,
+      blockedUntil: null,
+    };
+
+    attemptData.attempts += 1;
+
+    // Bloquear por 2 minutos después de 3 intentos fallidos
+    if (attemptData.attempts >= 3) {
+      attemptData.blockedUntil = Date.now() + 2 * 60 * 1000; // 2 minutos
+      console.log(`🔒 Usuario bloqueado: ${identifier} por 2 minutos`);
+    }
+
+    this.loginAttempts.set(identifier, attemptData);
+  }
+
+  private clearFailedAttempts(identifier: string): void {
+    this.loginAttempts.delete(identifier);
+  }
+
   // ========== LOGIN ==========
   async login(loginDto: LoginDto, session: any) {
     const { correoElectronico, contrasena } = loginDto;
 
+    // Verificar si está bloqueado
+    this.checkIfBlocked(correoElectronico);
+
     const user = await this.usersService.findByEmail(correoElectronico);
     if (!user) {
+      this.recordFailedAttempt(correoElectronico);
       throw new UnauthorizedException('Credenciales incorrectas');
     }
 
     const isMatch = await this.usersService.validatePassword(contrasena, user.contrasena);
     if (!isMatch) {
+      this.recordFailedAttempt(correoElectronico);
       throw new UnauthorizedException('Credenciales incorrectas');
     }
+
+    // Login exitoso - limpiar intentos fallidos
+    this.clearFailedAttempts(correoElectronico);
 
     const token = this.createToken(user);
 
@@ -203,7 +259,7 @@ export class AuthService {
     };
   }
 
-  // ========== LOGIN CON GOOGLE ==========
+  // ========== LOGIN CON GOOGLE (VERSIÓN UNIFICADA) ==========
   async googleAuth(googleAuthDto: GoogleAuthDto, session: any) {
     const { googleToken } = googleAuthDto;
 
@@ -223,6 +279,7 @@ export class AuthService {
 
       let user = await this.usersService.findByEmail(email);
 
+      // Si el usuario no existe, lo creamos automáticamente
       if (!user) {
         const hashedPassword = await bcrypt.hash(sub, 10);
         user = await this.usersService.create({
@@ -232,6 +289,9 @@ export class AuthService {
           contrasena: hashedPassword,
         });
       }
+
+      // Limpiar cualquier intento fallido previo
+      this.clearFailedAttempts(email);
 
       const token = this.createToken(user);
 
