@@ -34,6 +34,6 @@ export class VerificationTemp {
   @Column({ default: false })
   verificado: boolean;
 
-  @CreateDateColumn()
+  @CreateDateColumn({ type: 'datetime' })
   createdAt: Date;
 }
