@@ -10,7 +10,7 @@ export class VerificationTemp {
   @PrimaryGeneratedColumn()
   id: number;
 
-  @Column({ unique: true })
+  @Column()
   correoElectronico: string;
 
   @Column()
