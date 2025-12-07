@@ -34,10 +34,6 @@ export class VerificationTemp {
   @Column({ default: false })
   verificado: boolean;
 
-  @CreateDateColumn({
-    type: 'timestamp',
-    precision: 0,
-    default: () => 'CURRENT_TIMESTAMP',
-  })
+  @CreateDateColumn()
   createdAt: Date;
 }
