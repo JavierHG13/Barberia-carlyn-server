@@ -19,11 +19,12 @@ export class EmailService {
 
   async sendVerificationEmail(email: string, name: string, code: number) {
     await this.transporter.sendMail({
-      from: `"Soporte" <${this.configService.get('EMAIL_USER')}>`,
+      from: `"Barbería Carlyn - Soporte" <${this.configService.get('EMAIL_USER')}>`,
       to: email,
-      subject: 'Verificación de correo electrónico',
+      subject: 'Verificación de correo',
       html: `
-        <h2>Hola ${name}</h2>
+        <h2>Hola ${name} 👋</h2>
+        <p>Bienvenido a <strong>Barbería Carlyn</strong>.</p>
         <p>Tu código de verificación es:</p>
         <h3>${code}</h3>
         <p>Ingresa este código en la aplicación para activar tu cuenta.</p>
@@ -33,12 +34,12 @@ export class EmailService {
 
   async sendPasswordRecoveryEmail(email: string, name: string, code: number) {
     await this.transporter.sendMail({
-      from: `"Soporte" <${this.configService.get('EMAIL_USER')}>`,
+      from: `"Barbería Carlyn - Soporte" <${this.configService.get('EMAIL_USER')}>`,
       to: email,
-      subject: 'Recuperación de contraseña',
+      subject: 'Barbería Carlyn – Recuperación de contraseña',
       html: `
         <h2>Hola ${name}</h2>
-        <p>Has solicitado recuperar tu contraseña.</p>
+        <p>Has solicitado recuperar tu contraseña de <strong>Barbería Carlyn</strong>.</p>
         <p>Tu código de recuperación es:</p>
         <h3>${code}</h3>
         <p>Ingresa este código en la aplicación para restablecer tu contraseña.</p>
@@ -50,12 +51,12 @@ export class EmailService {
 
   async sendPasswordChangedEmail(email: string, name: string) {
     await this.transporter.sendMail({
-      from: `"Soporte" <${this.configService.get('EMAIL_USER')}>`,
+      from: `"Barbería Carlyn - Soporte" <${this.configService.get('EMAIL_USER')}>`,
       to: email,
-      subject: 'Contraseña actualizada',
+      subject: 'Tu contraseña ha sido actualizada',
       html: `
         <h2>Hola ${name}</h2>
-        <p>Tu contraseña ha sido actualizada exitosamente.</p>
+        <p>Queremos informarte que tu contraseña ha sido actualizada exitosamente.</p>
         <p>Si no realizaste este cambio, contacta inmediatamente con soporte.</p>
       `,
     });

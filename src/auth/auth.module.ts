@@ -5,6 +5,8 @@ import { UsersModule } from '../users/users.module';
 import { EmailService } from '../email/email.service';
 import { AuthController } from './auth.controller';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { VerificationTemp } from './enty/verification.entity';
 
 @Module({
   imports: [
@@ -18,9 +20,10 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
         signOptions: { expiresIn: '1h' },
       }),
     }),
+    TypeOrmModule.forFeature([VerificationTemp]),
   ],
   providers: [AuthService, EmailService],
-  controllers:[AuthController],
+  controllers: [AuthController],
   exports: [AuthService],
 })
 export class AuthModule {}

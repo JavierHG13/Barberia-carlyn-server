@@ -1,3 +1,4 @@
+
 import {
   Injectable,
   BadRequestException,
@@ -6,12 +7,15 @@ import {
   HttpException,
   HttpStatus,
 } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository, LessThan } from 'typeorm';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
 import { OAuth2Client } from 'google-auth-library';
 import { ConfigService } from '@nestjs/config';
 import { UsersService } from '../users/users.service';
 import { EmailService } from '../email/email.service';
+import { VerificationTemp } from './enty/verification.entity';
 import {
   RegisterDto,
   LoginDto,
@@ -23,64 +27,52 @@ import {
 @Injectable()
 export class AuthService {
   private googleClient: OAuth2Client;
-  
-  // Map temporal para almacenar datos de registro
-  private tempRegistrations = new Map<string, {
-    nombreCompleto: string;
-    correoElectronico: string;
-    telefono: string;
-    contrasena: string;
-    verificationCode: number;
-    createdAt: number;
-  }>();
-
-  // Map para recuperación de contraseña
-  private passwordRecovery = new Map<string, {
-    userId: number;
-    recoveryCode: number;
-    createdAt: number;
-    verified: boolean;
-  }>();
-
-  // Map para control de intentos fallidos de login
-  private loginAttempts = new Map<string, {
-    attempts: number;
-    blockedUntil: number | null;
-  }>();
 
   constructor(
     private readonly usersService: UsersService,
     private readonly jwtService: JwtService,
     private readonly emailService: EmailService,
     private readonly configService: ConfigService,
+    @InjectRepository(VerificationTemp)
+    private verificationRepository: Repository<VerificationTemp>,
   ) {
     this.googleClient = new OAuth2Client(
       this.configService.get('GOOGLE_CLIENT_ID'),
     );
   }
 
+  // ========== REGISTRO ==========
   async register(registerDto: RegisterDto, session: any) {
     const { nombreCompleto, correoElectronico, telefono, contrasena } = registerDto;
 
     const existingUser = await this.usersService.findByEmail(correoElectronico);
     if (existingUser) {
-      throw new BadRequestException('El correo electrónico ya está registrado');
+      throw new BadRequestException('Error al registrarse');
     }
+
+    // Eliminar verificaciones anteriores del mismo correo
+    await this.verificationRepository.delete({
+      correoElectronico,
+      tipo: 'registro',
+    });
 
     const hashedPassword = await bcrypt.hash(contrasena, 10);
     const verificationCode = Math.floor(100000 + Math.random() * 900000);
 
-    this.tempRegistrations.set(correoElectronico, {
-      nombreCompleto,
+    // Guardar en la tabla temporal
+    await this.verificationRepository.save({
       correoElectronico,
+      nombreCompleto,
       telefono,
       contrasena: hashedPassword,
-      verificationCode,
-      createdAt: Date.now(),
+      codigoVerificacion: verificationCode,
+      tipo: 'registro',
     });
 
     console.log('Registro guardado:', correoElectronico, '- Código:', verificationCode);
-    this.cleanOldRegistrations();
+
+    // Limpiar registros antiguos
+    await this.cleanOldVerifications();
 
     await this.emailService.sendVerificationEmail(
       correoElectronico,
@@ -93,40 +85,49 @@ export class AuthService {
     };
   }
 
+  // ========== VERIFICAR EMAIL ==========
   async verifyEmail(code: string, correoElectronico: string) {
     console.log('🔍 Verificando:', correoElectronico);
-    
-    const tempUserData = this.tempRegistrations.get(correoElectronico);
 
-    if (!tempUserData) {
-      console.error('No se encontró registro para:', correoElectronico);
+    const verification = await this.verificationRepository.findOne({
+      where: {
+        correoElectronico,
+        tipo: 'registro',
+      },
+    });
+
+    if (!verification) {
       throw new BadRequestException('No hay registro pendiente de verificación');
     }
 
+    // Verificar expiración (4 minutos)
     const EXPIRATION_TIME = 4 * 60 * 1000;
-    if (Date.now() - tempUserData.createdAt > EXPIRATION_TIME) {
-      this.tempRegistrations.delete(correoElectronico);
+    const createdAt = new Date(verification.createdAt).getTime();
+    if (Date.now() - createdAt > EXPIRATION_TIME) {
+      await this.verificationRepository.delete({ id: verification.id });
       throw new BadRequestException('El código de verificación ha expirado');
     }
 
-    if (parseInt(code) !== tempUserData.verificationCode) {
+    if (parseInt(code) !== verification.codigoVerificacion) {
       throw new BadRequestException('Código incorrecto');
     }
 
     const existing = await this.usersService.findByEmail(correoElectronico);
     if (existing) {
-      this.tempRegistrations.delete(correoElectronico);
+      await this.verificationRepository.delete({ id: verification.id });
       throw new BadRequestException('El correo ya está registrado');
     }
 
+    // Crear el usuario real
     const newUser = await this.usersService.create({
-      nombreCompleto: tempUserData.nombreCompleto,
-      correoElectronico: tempUserData.correoElectronico,
-      telefono: tempUserData.telefono,
-      contrasena: tempUserData.contrasena,
+      nombreCompleto: verification.nombreCompleto,
+      correoElectronico: verification.correoElectronico,
+      telefono: verification.telefono,
+      contrasena: verification.contrasena,
     });
 
-    this.tempRegistrations.delete(correoElectronico);
+    // Eliminar de la tabla temporal
+    await this.verificationRepository.delete({ id: verification.id });
 
     return {
       message: 'Correo verificado exitosamente. Tu cuenta ha sido creada.',
@@ -138,74 +139,227 @@ export class AuthService {
     };
   }
 
+  // ========== REENVIAR CÓDIGO ==========
   async resendCode(correoElectronico: string) {
-    const tempUserData = this.tempRegistrations.get(correoElectronico);
+    // Verificar límites de reenvío
+    await this.checkResendLimit(correoElectronico);
 
-    if (!tempUserData) {
-      throw new BadRequestException('No hay registro pendiente de verificación');
+    const verification = await this.verificationRepository.findOne({
+      where: {
+        correoElectronico,
+        tipo: 'registro',
+      },
+    });
+
+    if (!verification) {
+      throw new BadRequestException('Error al registrarse');
     }
 
     const verificationCode = Math.floor(100000 + Math.random() * 900000);
 
-    this.tempRegistrations.set(correoElectronico, {
-      ...tempUserData,
-      verificationCode,
-      createdAt: Date.now(),
-    });
+    // Actualizar código y fecha
+    verification.codigoVerificacion = verificationCode;
+    verification.createdAt = new Date();
+    await this.verificationRepository.save(verification);
+
+    // Registrar intento de reenvío
+    await this.recordResendAttempt(correoElectronico);
 
     console.log('🔄 Código reenviado:', correoElectronico, '- Nuevo código:', verificationCode);
 
     await this.emailService.sendVerificationEmail(
       correoElectronico,
-      tempUserData.nombreCompleto,
+      verification.nombreCompleto,
       verificationCode,
     );
 
     return { message: 'Nuevo código enviado. Revisa tu correo.' };
   }
 
-  private cleanOldRegistrations() {
-    const TEN_MINUTES = 10 * 60 * 1000;
-    const now = Date.now();
+  // ========== RECUPERACIÓN DE CONTRASEÑA ==========
+  async forgotPassword(forgotPasswordDto: ForgotPasswordDto) {
+    const { correoElectronico } = forgotPasswordDto;
 
-    for (const [email, data] of this.tempRegistrations.entries()) {
-      if (now - data.createdAt > TEN_MINUTES) {
-        this.tempRegistrations.delete(email);
-      }
+    const user = await this.usersService.findByEmail(correoElectronico);
+    if (!user) {
+      throw new NotFoundException('No existe una cuenta con ese correo');
     }
+
+    // Eliminar recuperaciones anteriores
+    await this.verificationRepository.delete({
+      correoElectronico,
+      tipo: 'recuperacion',
+    });
+
+    const recoveryCode = Math.floor(100000 + Math.random() * 900000);
+
+    // Guardar en tabla temporal
+    await this.verificationRepository.save({
+      correoElectronico,
+      nombreCompleto: user.nombreCompleto,
+      telefono: '',
+      contrasena: '',
+      codigoVerificacion: recoveryCode,
+      tipo: 'recuperacion',
+      userId: user.id,
+      verificado: false,
+    });
+
+    console.log('🔑 Código de recuperación generado:', correoElectronico, '- Código:', recoveryCode);
+
+    await this.emailService.sendPasswordRecoveryEmail(
+      correoElectronico,
+      user.nombreCompleto,
+      recoveryCode,
+    );
+
+    return { message: 'Código de recuperación enviado. Revisa tu correo.' };
   }
 
-  // ========== CONTROL DE INTENTOS FALLIDOS ==========
+  // ========== VERIFICAR CÓDIGO DE RECUPERACIÓN ==========
+  async verifyRecoveryCode(code: string, correoElectronico: string) {
+    const verification = await this.verificationRepository.findOne({
+      where: {
+        correoElectronico,
+        tipo: 'recuperacion',
+      },
+    });
+
+    if (!verification) {
+      throw new BadRequestException('No hay solicitud de recuperación activa');
+    }
+
+    // Verificar expiración (10 minutos)
+    const EXPIRATION_TIME = 10 * 60 * 1000;
+    const createdAt = new Date(verification.createdAt).getTime();
+    if (Date.now() - createdAt > EXPIRATION_TIME) {
+      await this.verificationRepository.delete({ id: verification.id });
+      throw new BadRequestException('El código de recuperación ha expirado');
+    }
+
+    if (parseInt(code) !== verification.codigoVerificacion) {
+      throw new BadRequestException('Código incorrecto');
+    }
+
+    // Marcar como verificado
+    verification.verificado = true;
+    await this.verificationRepository.save(verification);
+
+    return { message: 'Código verificado correctamente' };
+  }
+
+  // ========== RESETEAR CONTRASEÑA ==========
+  async resetPassword(resetPasswordDto: ResetPasswordDto, correoElectronico: string) {
+    const { newPassword } = resetPasswordDto;
+
+    const verification = await this.verificationRepository.findOne({
+      where: {
+        correoElectronico,
+        tipo: 'recuperacion',
+        verificado: true,
+      },
+    });
+
+    if (!verification) {
+      throw new BadRequestException('No hay solicitud de recuperación activa');
+    }
+
+    // Verificar expiración
+    const EXPIRATION_TIME = 10 * 60 * 1000;
+    const createdAt = new Date(verification.createdAt).getTime();
+    if (Date.now() - createdAt > EXPIRATION_TIME) {
+      await this.verificationRepository.delete({ id: verification.id });
+      throw new BadRequestException('La sesión ha expirado');
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    await this.usersService.update(verification.userId, {
+      contrasena: hashedPassword,
+    });
+
+    const user = await this.usersService.findOne(verification.userId);
+    if (!user) {
+      throw new NotFoundException('Usuario no encontrado');
+    }
+
+    await this.emailService.sendPasswordChangedEmail(
+      correoElectronico,
+      user.nombreCompleto,
+    );
+
+    // Eliminar de la tabla temporal
+    await this.verificationRepository.delete({ id: verification.id });
+
+    return { message: 'Contraseña actualizada exitosamente' };
+  }
+
+  // ========== REENVIAR CÓDIGO DE RECUPERACIÓN ==========
+  async resendRecoveryCode(correoElectronico: string) {
+    await this.checkResendLimit(correoElectronico);
+
+    const verification = await this.verificationRepository.findOne({
+      where: {
+        correoElectronico,
+        tipo: 'recuperacion',
+      },
+    });
+
+    if (!verification) {
+      throw new BadRequestException('No hay solicitud de recuperación activa');
+    }
+
+    const recoveryCode = Math.floor(100000 + Math.random() * 900000);
+
+    // Actualizar código
+    verification.codigoVerificacion = recoveryCode;
+    verification.createdAt = new Date();
+    verification.verificado = false;
+    await this.verificationRepository.save(verification);
+
+    await this.recordResendAttempt(correoElectronico);
+
+    console.log('🔄 Código de recuperación reenviado:', correoElectronico, '- Nuevo código:', recoveryCode);
+
+    const user = await this.usersService.findOne(verification.userId);
+    if (!user) {
+      throw new NotFoundException('Usuario no encontrado');
+    }
+
+    await this.emailService.sendPasswordRecoveryEmail(
+      correoElectronico,
+      user.nombreCompleto,
+      recoveryCode,
+    );
+
+    return { message: 'Nuevo código enviado. Revisa tu correo.' };
+  }
+
+  // ========== CONTROL DE INTENTOS DE LOGIN ==========
+  private loginAttempts = new Map<string, { attempts: number; blockedUntil: number | null }>();
+
   private checkIfBlocked(identifier: string): void {
     const attemptData = this.loginAttempts.get(identifier);
-    
     if (!attemptData) return;
 
     if (attemptData.blockedUntil && Date.now() < attemptData.blockedUntil) {
       const remainingTime = Math.ceil((attemptData.blockedUntil - Date.now()) / 1000);
       throw new HttpException(
         `Demasiados intentos fallidos. Intenta de nuevo en ${remainingTime} segundos`,
-        HttpStatus.TOO_MANY_REQUESTS
+        HttpStatus.TOO_MANY_REQUESTS,
       );
     }
 
-    // Si el bloqueo ya expiró, reiniciar
     if (attemptData.blockedUntil && Date.now() >= attemptData.blockedUntil) {
       this.loginAttempts.delete(identifier);
     }
   }
 
   private recordFailedAttempt(identifier: string): void {
-    const attemptData = this.loginAttempts.get(identifier) || {
-      attempts: 0,
-      blockedUntil: null,
-    };
-
+    const attemptData = this.loginAttempts.get(identifier) || { attempts: 0, blockedUntil: null };
     attemptData.attempts += 1;
 
-    // Bloquear por 2 minutos después de 3 intentos fallidos
     if (attemptData.attempts >= 3) {
-      attemptData.blockedUntil = Date.now() + 2 * 60 * 1000; // 2 minutos
+      attemptData.blockedUntil = Date.now() + 2 * 60 * 1000;
       console.log(`🔒 Usuario bloqueado: ${identifier} por 2 minutos`);
     }
 
@@ -216,11 +370,57 @@ export class AuthService {
     this.loginAttempts.delete(identifier);
   }
 
+  // ========== CONTROL DE REENVÍOS ==========
+  private resendAttempts = new Map<string, { attempts: number; lastAttempt: number; blockedUntil: number | null }>();
+
+  private async checkResendLimit(correoElectronico: string): Promise<void> {
+    const resendData = this.resendAttempts.get(correoElectronico);
+    if (!resendData) return;
+
+    if (resendData.blockedUntil && Date.now() < resendData.blockedUntil) {
+      const remainingTime = Math.ceil((resendData.blockedUntil - Date.now()) / 1000);
+      throw new HttpException(
+        `Demasiados reenvíos. Espera ${remainingTime} segundos antes de intentar nuevamente`,
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    const COOLDOWN = 30 * 1000;
+    if (Date.now() - resendData.lastAttempt < COOLDOWN) {
+      const remainingTime = Math.ceil((COOLDOWN - (Date.now() - resendData.lastAttempt)) / 1000);
+      throw new HttpException(
+        `Debes esperar ${remainingTime} segundos antes de solicitar otro código`,
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    if (resendData.blockedUntil && Date.now() >= resendData.blockedUntil) {
+      this.resendAttempts.delete(correoElectronico);
+    }
+  }
+
+  private async recordResendAttempt(correoElectronico: string): Promise<void> {
+    const resendData = this.resendAttempts.get(correoElectronico) || {
+      attempts: 0,
+      lastAttempt: 0,
+      blockedUntil: null,
+    };
+
+    resendData.attempts += 1;
+    resendData.lastAttempt = Date.now();
+
+    if (resendData.attempts >= 5) {
+      resendData.blockedUntil = Date.now() + 10 * 60 * 1000;
+      console.log(`🔒 Reenvíos bloqueados para: ${correoElectronico} por 10 minutos`);
+    }
+
+    this.resendAttempts.set(correoElectronico, resendData);
+  }
+
   // ========== LOGIN ==========
   async login(loginDto: LoginDto, session: any) {
     const { correoElectronico, contrasena } = loginDto;
 
-    // Verificar si está bloqueado
     this.checkIfBlocked(correoElectronico);
 
     const user = await this.usersService.findByEmail(correoElectronico);
@@ -235,7 +435,6 @@ export class AuthService {
       throw new UnauthorizedException('Credenciales incorrectas');
     }
 
-    // Login exitoso - limpiar intentos fallidos
     this.clearFailedAttempts(correoElectronico);
 
     const token = this.createToken(user);
@@ -259,7 +458,7 @@ export class AuthService {
     };
   }
 
-  // ========== LOGIN CON GOOGLE (VERSIÓN UNIFICADA) ==========
+  // ========== LOGIN CON GOOGLE ==========
   async googleAuth(googleAuthDto: GoogleAuthDto, session: any) {
     const { googleToken } = googleAuthDto;
 
@@ -270,7 +469,7 @@ export class AuthService {
       });
 
       const payload = ticket.getPayload();
-      
+
       if (!payload || !payload.email) {
         throw new BadRequestException('Token de Google inválido');
       }
@@ -279,7 +478,6 @@ export class AuthService {
 
       let user = await this.usersService.findByEmail(email);
 
-      // Si el usuario no existe, lo creamos automáticamente
       if (!user) {
         const hashedPassword = await bcrypt.hash(sub, 10);
         user = await this.usersService.create({
@@ -290,7 +488,6 @@ export class AuthService {
         });
       }
 
-      // Limpiar cualquier intento fallido previo
       this.clearFailedAttempts(email);
 
       const token = this.createToken(user);
@@ -317,128 +514,13 @@ export class AuthService {
     }
   }
 
-  // ========== RECUPERACIÓN DE CONTRASEÑA ==========
-  async forgotPassword(forgotPasswordDto: ForgotPasswordDto) {
-    const { correoElectronico } = forgotPasswordDto;
+  // ========== LIMPIAR VERIFICACIONES ANTIGUAS ==========
+  private async cleanOldVerifications() {
+    const TEN_MINUTES_AGO = new Date(Date.now() - 10 * 60 * 1000);
 
-    const user = await this.usersService.findByEmail(correoElectronico);
-    if (!user) {
-      throw new NotFoundException('No existe una cuenta con ese correo');
-    }
-
-    const recoveryCode = Math.floor(100000 + Math.random() * 900000);
-
-    this.passwordRecovery.set(correoElectronico, {
-      userId: user.id,
-      recoveryCode,
-      createdAt: Date.now(),
-      verified: false,
+    await this.verificationRepository.delete({
+      createdAt: LessThan(TEN_MINUTES_AGO),
     });
-
-    console.log('🔑 Código de recuperación generado:', correoElectronico, '- Código:', recoveryCode);
-
-    await this.emailService.sendPasswordRecoveryEmail(
-      correoElectronico,
-      user.nombreCompleto,
-      recoveryCode,
-    );
-
-    return { message: 'Código de recuperación enviado. Revisa tu correo.' };
-  }
-
-  async verifyRecoveryCode(code: string, correoElectronico: string) {
-    const recovery = this.passwordRecovery.get(correoElectronico);
-
-    if (!recovery) {
-      throw new BadRequestException('No hay solicitud de recuperación activa');
-    }
-
-    const EXPIRATION_TIME = 10 * 60 * 1000;
-    if (Date.now() - recovery.createdAt > EXPIRATION_TIME) {
-      this.passwordRecovery.delete(correoElectronico);
-      throw new BadRequestException('El código de recuperación ha expirado');
-    }
-
-    if (parseInt(code) !== recovery.recoveryCode) {
-      throw new BadRequestException('Código incorrecto');
-    }
-
-    this.passwordRecovery.set(correoElectronico, {
-      ...recovery,
-      verified: true,
-    });
-
-    return { message: 'Código verificado correctamente' };
-  }
-
-  async resetPassword(resetPasswordDto: ResetPasswordDto, correoElectronico: string) {
-    const { newPassword } = resetPasswordDto;
-    const recovery = this.passwordRecovery.get(correoElectronico);
-
-    if (!recovery) {
-      throw new BadRequestException('No hay solicitud de recuperación activa');
-    }
-
-    if (!recovery.verified) {
-      throw new BadRequestException('Debes verificar el código primero');
-    }
-
-    const EXPIRATION_TIME = 10 * 60 * 1000;
-    if (Date.now() - recovery.createdAt > EXPIRATION_TIME) {
-      this.passwordRecovery.delete(correoElectronico);
-      throw new BadRequestException('La sesión ha expirado');
-    }
-
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-    await this.usersService.update(recovery.userId, {
-      contrasena: hashedPassword,
-    });
-
-    const user = await this.usersService.findOne(recovery.userId);
-    if (!user) {
-      throw new NotFoundException('Usuario no encontrado');
-    }
-
-    await this.emailService.sendPasswordChangedEmail(
-      correoElectronico,
-      user.nombreCompleto,
-    );
-
-    this.passwordRecovery.delete(correoElectronico);
-
-    return { message: 'Contraseña actualizada exitosamente' };
-  }
-
-  async resendRecoveryCode(correoElectronico: string) {
-    const recovery = this.passwordRecovery.get(correoElectronico);
-
-    if (!recovery) {
-      throw new BadRequestException('No hay solicitud de recuperación activa');
-    }
-
-    const recoveryCode = Math.floor(100000 + Math.random() * 900000);
-
-    this.passwordRecovery.set(correoElectronico, {
-      ...recovery,
-      recoveryCode,
-      createdAt: Date.now(),
-      verified: false,
-    });
-
-    console.log('🔄 Código de recuperación reenviado:', correoElectronico, '- Nuevo código:', recoveryCode);
-
-    const user = await this.usersService.findOne(recovery.userId);
-    if (!user) {
-      throw new NotFoundException('Usuario no encontrado');
-    }
-
-    await this.emailService.sendPasswordRecoveryEmail(
-      correoElectronico,
-      user.nombreCompleto,
-      recoveryCode,
-    );
-
-    return { message: 'Nuevo código enviado. Revisa tu correo.' };
   }
 
   // ========== UTILIDADES ==========
