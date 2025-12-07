@@ -568,4 +568,16 @@ export class AuthService {
 
     return { message: 'Contraseña actualizada exitosamente' };
   }
+
+
+ private cleanOldRegistrations() {
+    const TEN_MINUTES = 10 * 60 * 1000;
+    const now = Date.now();
+
+    for (const [email, data] of this.tempRegistrations.entries()) {
+      if (now - data.createdAt > TEN_MINUTES) {
+        this.tempRegistrations.delete(email);
+      }
+    }
+  }
 }
