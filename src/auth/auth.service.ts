@@ -84,7 +84,7 @@ export class AuthService {
 
     const existingUser = await this.usersService.findByEmail(correoElectronico);
     if (existingUser) {
-      throw new BadRequestException('El correo electrónico ya está registrado');
+      throw new BadRequestException('Error al registrarse');
     }
 
     const hashedPassword = await bcrypt.hash(contrasena, 10);
