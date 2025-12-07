@@ -2,7 +2,6 @@ import {
   Entity,
   Column,
   PrimaryGeneratedColumn,
-  CreateDateColumn,
 } from 'typeorm';
 
 @Entity('tbl_verificaciones_temporales')
@@ -34,6 +33,6 @@ export class VerificationTemp {
   @Column({ default: false })
   verificado: boolean;
 
-  @CreateDateColumn({ type: 'datetime', default: () => 'CURRENT_TIMESTAMP' })
+  @Column({ type: 'timestamp', default: () => 'CURRENT_TIMESTAMP' })
   createdAt: Date;
 }
