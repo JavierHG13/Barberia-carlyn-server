@@ -4,16 +4,7 @@ import * as fs from 'fs';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
-  /*let httpsOptions: { key: Buffer; cert: Buffer } | undefined;
-
-  if (process.env.NODE_ENV !== 'production') {
-    httpsOptions = {
-      key: fs.readFileSync('C:/mkcert/localhost-key.pem'),
-      cert: fs.readFileSync('C:/mkcert/localhost.pem'),
-    };
-  }
-
-  const app = await NestFactory.create(AppModule, { httpsOptions });*/
+ 
   const app = await NestFactory.create(AppModule);
 
   app.enableCors({
@@ -28,12 +19,6 @@ async function bootstrap() {
     }),
   );
 
-  /*if (process.env.NODE_ENV !== 'production') {
-    await app.listen(3000);
-    console.log('Servidor local en https://localhost:3000');
-  } else {
-    await app.init();
-  }*/
 
   await app.listen(3000);
 
