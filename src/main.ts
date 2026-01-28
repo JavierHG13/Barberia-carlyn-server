@@ -1,20 +1,17 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
-import * as fs from 'fs';
 import { AppModule } from './app.module';
+import serverless from 'serverless-http';
+
+let cachedServer;
 
 async function bootstrap() {
- 
   const app = await NestFactory.create(AppModule);
 
-  console.log('FRONTEND_URL:', process.env.FRONTEND_URL);
-
   app.enableCors({
-    origin: process.env.FRONTEND_URL || 'https://barberia-carlyn.netlify.app',
+    origin: process.env.FRONTEND_URL,
     credentials: true,
   });
-
-
 
   app.useGlobalPipes(
     new ValidationPipe({
@@ -23,13 +20,14 @@ async function bootstrap() {
     }),
   );
 
-
-  await app.listen(3000);
-  
-
   await app.init();
 
-  return app;
+  return serverless(app.getHttpAdapter().getInstance());
 }
 
-bootstrap();
+export const handler = async (event, context) => {
+  if (!cachedServer) {
+    cachedServer = await bootstrap();
+  }
+  return cachedServer(event, context);
+};
