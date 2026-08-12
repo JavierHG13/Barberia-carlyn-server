@@ -233,6 +233,66 @@ class Appointment {
     return result.rows[0] ?? null;
   }
 
+  static async countByClientOnDate({
+    clienteId,
+    fecha,
+    excludeId = null,
+    excludedEstadoIds = [],
+  }) {
+    const values = [clienteId, fecha];
+    let idx = 3;
+
+    let query = `
+      SELECT COUNT(*)::INT AS total
+      FROM citas c
+      WHERE c.cliente_id = $1
+        AND c.fecha = $2
+    `;
+
+    if (excludedEstadoIds.length > 0) {
+      query += ` AND c.estado_id NOT IN (${excludedEstadoIds.map(() => `$${idx++}`).join(', ')})`;
+      values.push(...excludedEstadoIds);
+    }
+
+    if (excludeId) {
+      query += ` AND c.id <> $${idx++}`;
+      values.push(excludeId);
+    }
+
+    const result = await pool.query(query, values);
+    return result.rows[0]?.total ?? 0;
+  }
+
+  static async countByBarberOnDate({
+    barberoId,
+    fecha,
+    excludeId = null,
+    excludedEstadoIds = [],
+  }) {
+    const values = [barberoId, fecha];
+    let idx = 3;
+
+    let query = `
+      SELECT COUNT(*)::INT AS total
+      FROM citas c
+      WHERE c.barbero_id = $1
+        AND c.fecha = $2
+    `;
+
+    if (excludedEstadoIds.length > 0) {
+      query += ` AND c.estado_id NOT IN (${excludedEstadoIds.map(() => `$${idx++}`).join(', ')})`;
+      values.push(...excludedEstadoIds);
+    }
+
+    if (excludeId) {
+      query += ` AND c.id <> $${idx++}`;
+      values.push(excludeId);
+    }
+
+    const result = await pool.query(query, values);
+    return result.rows[0]?.total ?? 0;
+  }
+
   static async create({
     clienteId,
     barberoId,
@@ -489,7 +549,12 @@ class Appointment {
 
     const result = await pool.query(
       `UPDATE citas
-       SET    estado_id  = $1,
+       SET    estado_id = $1,
+              motivo_cancelacion = CASE
+                WHEN COALESCE(monto_pagado, 0) > 0
+                  THEN 'No asistencia con pago registrado; pago retenido para seguimiento administrativo.'
+                ELSE COALESCE(motivo_cancelacion, 'No asistencia registrada automaticamente.')
+              END,
               updated_at = NOW()
        WHERE  fecha      < $2
          AND  estado_id IN (${placeholders})`,

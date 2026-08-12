@@ -20,6 +20,10 @@ const parsePositiveInt = (value) => {
   return Number.isNaN(parsed) || parsed <= 0 ? null : parsed;
 };
 
+const MAX_CITAS_CLIENTE_POR_DIA = parsePositiveInt(process.env.MAX_CITAS_CLIENTE_POR_DIA) || 2;
+const MAX_CITAS_BARBERO_POR_DIA = parsePositiveInt(process.env.MAX_CITAS_BARBERO_POR_DIA);
+const RELEASED_ESTADO_IDS = [CANCELLED_ESTADO_ID, NO_SHOW_ESTADO_ID];
+
 const normalizeRole = (role) => String(role || '').trim().toLowerCase();
 
 /**
@@ -93,6 +97,42 @@ const resolveLocalParaCita = async (barberoId, localIdInput) => {
   }
 
   return localId;
+};
+
+const validateDailyAppointmentLimits = async ({ clienteId, barberoId, fecha, excludeId = null }) => {
+  if (MAX_CITAS_CLIENTE_POR_DIA) {
+    const totalCliente = await Appointment.countByClientOnDate({
+      clienteId,
+      fecha,
+      excludeId,
+      excludedEstadoIds: RELEASED_ESTADO_IDS,
+    });
+
+    if (totalCliente >= MAX_CITAS_CLIENTE_POR_DIA) {
+      return {
+        status: 409,
+        message: `El cliente ya alcanzo el limite de ${MAX_CITAS_CLIENTE_POR_DIA} cita(s) por dia`,
+      };
+    }
+  }
+
+  if (MAX_CITAS_BARBERO_POR_DIA) {
+    const totalBarbero = await Appointment.countByBarberOnDate({
+      barberoId,
+      fecha,
+      excludeId,
+      excludedEstadoIds: RELEASED_ESTADO_IDS,
+    });
+
+    if (totalBarbero >= MAX_CITAS_BARBERO_POR_DIA) {
+      return {
+        status: 409,
+        message: `El barbero ya alcanzo el limite de ${MAX_CITAS_BARBERO_POR_DIA} cita(s) por dia`,
+      };
+    }
+  }
+
+  return null;
 };
 
 // ─── Controllers ────────────────────────────────────────────────────────────
@@ -173,6 +213,15 @@ export const createAppointment = async (req, res, next) => {
       return res.status(409).json({
         message: `Ya existe una cita en ese horario. Debe haber ${APPOINTMENT_BREAK_MINUTES} minutos de descanso entre citas`,
       });
+    }
+
+    const limitError = await validateDailyAppointmentLimits({
+      clienteId: Number(effectiveClienteId),
+      barberoId: Number(barberoId),
+      fecha,
+    });
+    if (limitError) {
+      return res.status(limitError.status).json({ message: limitError.message });
     }
 
     const appointment = await Appointment.create({
@@ -343,6 +392,7 @@ export const updateAppointment = async (req, res, next) => {
 
     // ── Conflict check (skip if moving to cancelled estado) ──────────────────
     const mergedEstadoId = updates.estadoId ?? existing.estado_id;
+    const mergedClienteId = updates.clienteId ?? existing.cliente_id;
     const mergedBarberoId = updates.barberoId ?? existing.barbero_id;
     const mergedFecha = updates.fecha ?? existing.fecha;
     const mergedStart = updates.horaInicio ?? existing.hora_inicio;
@@ -363,6 +413,18 @@ export const updateAppointment = async (req, res, next) => {
         return res.status(409).json({
           message: `Ya existe otra cita en ese horario. Debe haber ${APPOINTMENT_BREAK_MINUTES} minutos de descanso entre citas`,
         });
+      }
+    }
+
+    if (!RELEASED_ESTADO_IDS.includes(mergedEstadoId)) {
+      const limitError = await validateDailyAppointmentLimits({
+        clienteId: mergedClienteId,
+        barberoId: mergedBarberoId,
+        fecha: mergedFecha,
+        excludeId: appointmentId,
+      });
+      if (limitError) {
+        return res.status(limitError.status).json({ message: limitError.message });
       }
     }
 
@@ -686,6 +748,7 @@ export const markNoShowAppointments = async (req, res, next) => {
 
     res.json({
       message: `${count} cita(s) marcada(s) como no_asistio`,
+      politica: 'Si una cita tenia pago registrado, el monto se conserva para seguimiento administrativo y no se reembolsa automaticamente.',
       updated: count,
     });
   } catch (error) {
