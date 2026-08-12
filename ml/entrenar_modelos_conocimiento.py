@@ -12,13 +12,17 @@ import numpy as np
 import pandas as pd
 import psycopg2
 from psycopg2.extras import Json, execute_values
+from sklearn.base import clone
 from sklearn.cluster import KMeans
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import accuracy_score, mean_absolute_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, precision_score, r2_score, recall_score
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.tree import DecisionTreeClassifier
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -320,7 +324,13 @@ def save_metric(conn, model_key, model_name, algorithm, samples, metrics, artifa
 
 def train_no_show(conn, df):
     train_df = df[df["estado_cita"] != "pendiente"].copy()
-    train_df["target"] = train_df["estado_cita"].isin(["no_show", "cancelada"]).astype(int)
+    label_map = {
+        "no_show": "Alta",
+        "cancelada": "Media",
+        "asistio": "Baja",
+    }
+    train_df["target"] = train_df["estado_cita"].map(label_map)
+    train_df = train_df.dropna(subset=["target"]).copy()
     features = [
         "local_nombre", "servicio_nombre", "barbero_nombre", "dia_semana", "semana", "precio",
         "duracion", "recordatorio_enviado", "frecuencia_cliente", "recencia_dias",
@@ -336,32 +346,69 @@ def train_no_show(conn, df):
         random_state=42,
         stratify=train_df["target"],
     )
-    model = Pipeline(
-        steps=[
-            ("prep", ColumnTransformer([
-                ("cat", OneHotEncoder(handle_unknown="ignore"), categorical),
-                ("num", StandardScaler(), numeric),
-            ])),
-            ("model", RandomForestClassifier(n_estimators=140, max_depth=8, random_state=42)),
-        ]
-    )
+
+    preprocess = ColumnTransformer([
+        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical),
+        ("num", StandardScaler(), numeric),
+    ])
+
+    candidates = {
+        "LogisticRegression": LogisticRegression(max_iter=1200, class_weight="balanced"),
+        "KNeighborsClassifier": KNeighborsClassifier(n_neighbors=9),
+        "DecisionTreeClassifier": DecisionTreeClassifier(max_depth=6, min_samples_leaf=10, class_weight="balanced", random_state=42),
+        "RandomForestClassifier": RandomForestClassifier(n_estimators=160, max_depth=9, min_samples_leaf=6, class_weight="balanced", random_state=42),
+        "GradientBoostingClassifier": GradientBoostingClassifier(n_estimators=120, learning_rate=0.06, max_depth=3, random_state=42),
+    }
+    scoring = {
+        "accuracy": "accuracy",
+        "precision": "precision_weighted",
+        "recall": "recall_weighted",
+        "f1": "f1_weighted",
+    }
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    model_comparison = []
+
+    for name, estimator in candidates.items():
+        pipeline = Pipeline([("prep", clone(preprocess)), ("model", estimator)])
+        scores = cross_validate(
+            pipeline,
+            train_df[features],
+            train_df["target"],
+            cv=cv,
+            scoring=scoring,
+            error_score="raise",
+        )
+        model_comparison.append({
+            "model": name,
+            "accuracy_mean": round(float(scores["test_accuracy"].mean()), 4),
+            "accuracy_std": round(float(scores["test_accuracy"].std()), 4),
+            "precision_mean": round(float(scores["test_precision"].mean()), 4),
+            "recall_mean": round(float(scores["test_recall"].mean()), 4),
+            "f1_mean": round(float(scores["test_f1"].mean()), 4),
+        })
+
+    best = max(model_comparison, key=lambda item: (item["f1_mean"], item["accuracy_mean"]))
+    model = Pipeline([("prep", clone(preprocess)), ("model", candidates[best["model"]])])
     model.fit(x_train, y_train)
     pred = model.predict(x_test)
-    probabilities = model.predict_proba(x_test)[:, 1]
+    probabilities = model.predict_proba(x_test).max(axis=1)
     artifact = ARTIFACT_DIR / "no_show_classifier.joblib"
     joblib.dump(model, artifact)
 
     candidates = df[df["fecha"] >= date.today()].copy()
     if len(candidates) < 10:
         candidates = df.sort_values("fecha", ascending=False).head(60).copy()
-    candidates["riesgo"] = model.predict_proba(candidates[features])[:, 1]
-    top = candidates.sort_values("riesgo", ascending=False).head(18)
+    candidates["nivel"] = model.predict(candidates[features])
+    candidates["confianza"] = model.predict_proba(candidates[features]).max(axis=1)
+    priority_order = {"Alta": 3, "Media": 2, "Baja": 1}
+    candidates["prioridad_orden"] = candidates["nivel"].map(priority_order).fillna(0)
+    top = candidates.sort_values(["prioridad_orden", "confianza", "fecha", "hora"], ascending=[False, False, True, True]).head(18)
 
     rows = []
     for item in top.itertuples():
-        riesgo = float(item.riesgo)
-        nivel = "Alto" if riesgo >= 0.68 else "Medio" if riesgo >= 0.42 else "Bajo"
-        accion = "Llamar y enviar recordatorio reforzado" if nivel == "Alto" else "Enviar WhatsApp de confirmacion"
+        confianza = float(item.confianza)
+        nivel = item.nivel
+        accion = "Llamar y enviar recordatorio reforzado" if nivel == "Alta" else "Enviar WhatsApp de confirmacion"
         rows.append(
             (
                 int(item.id),
@@ -370,7 +417,7 @@ def train_no_show(conn, df):
                 item.cliente_nombre,
                 item.servicio_nombre,
                 item.local_nombre,
-                round(riesgo, 4),
+                round(confianza, 4),
                 nivel,
                 accion,
             )
@@ -391,9 +438,18 @@ def train_no_show(conn, df):
         conn,
         "no-show",
         "Riesgo de inasistencia",
-        "RandomForestClassifier",
+        best["model"],
         len(train_df),
-        {"accuracy": round(float(accuracy_score(y_test, pred)), 4), "risk_mean": round(float(np.mean(probabilities)), 4)},
+        {
+            "accuracy": round(float(accuracy_score(y_test, pred)), 4),
+            "precision": round(float(precision_score(y_test, pred, average="weighted", zero_division=0)), 4),
+            "recall": round(float(recall_score(y_test, pred, average="weighted", zero_division=0)), 4),
+            "f1": round(float(f1_score(y_test, pred, average="weighted", zero_division=0)), 4),
+            "confidence_mean": round(float(np.mean(probabilities)), 4),
+            "selection_metric": "f1_mean, tie_breaker accuracy_mean",
+            "classes": ["Alta", "Media", "Baja"],
+            "cross_validation": model_comparison,
+        },
         artifact,
     )
 

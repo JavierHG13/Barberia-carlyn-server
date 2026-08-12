@@ -74,6 +74,8 @@ const APPOINTMENT_UPDATE_MAP = {
 };
 
 const normalizeRole = (role) => String(role || '').trim().toLowerCase();
+const MX_CURRENT_DATE = `(NOW() AT TIME ZONE 'America/Mexico_City')::date`;
+const MX_CURRENT_TIME = `(NOW() AT TIME ZONE 'America/Mexico_City')::time`;
 
 /**
  * Build a WHERE clause from filter options.
@@ -145,16 +147,16 @@ const buildWhereClause = (
 
   if (scope === 'proximas') {
     conditions.push(`(
-      c.fecha > CURRENT_DATE
-      OR (c.fecha = CURRENT_DATE AND c.hora_fin >= CURRENT_TIME)
+      c.fecha > ${MX_CURRENT_DATE}
+      OR (c.fecha = ${MX_CURRENT_DATE} AND c.hora_fin >= ${MX_CURRENT_TIME})
     )`);
     conditions.push(`LOWER(COALESCE(e.nombre, '')) NOT IN ('completada', 'cancelada', 'no_asistio', 'no asistio')`);
   }
 
   if (scope === 'historial') {
     conditions.push(`(
-      c.fecha < CURRENT_DATE
-      OR (c.fecha = CURRENT_DATE AND c.hora_fin < CURRENT_TIME)
+      c.fecha < ${MX_CURRENT_DATE}
+      OR (c.fecha = ${MX_CURRENT_DATE} AND c.hora_fin < ${MX_CURRENT_TIME})
       OR LOWER(COALESCE(e.nombre, '')) IN ('completada', 'cancelada', 'no_asistio', 'no asistio')
     )`);
   }

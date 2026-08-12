@@ -11,6 +11,7 @@ const serverRoot = path.resolve(__dirname, '..', '..');
  * Calcula la predicción de citas usando modelo exponencial dx/dt = kx
  * Solución: x(t) = x0 * e^(kt)
  */
+
 export const calcularPrediccion = async (req, res) => {
     try {
         console.log('Body recibido:', req.body);
@@ -416,43 +417,65 @@ const getNoShowModule = async () => {
     const [metric, predictions] = await Promise.all([
         getMetric('no-show'),
         query(
-            `SELECT id, cita_dataset_id, fecha, hora, cliente_nombre, servicio_nombre,
-                    local_nombre, riesgo, nivel, accion_sugerida
-             FROM analitica.ml_no_show_predictions
-             ORDER BY riesgo DESC, fecha ASC, hora ASC
+            `SELECT p.id, p.cita_dataset_id, p.fecha, p.hora, p.cliente_nombre, p.servicio_nombre,
+                    p.local_nombre, p.riesgo, p.nivel, p.accion_sugerida,
+                    COALESCE(u.telefono, '') AS cliente_telefono,
+                    COALESCE(u.email, '') AS cliente_email
+             FROM analitica.ml_no_show_predictions p
+             LEFT JOIN analitica.ml_citas_dataset d ON d.id = p.cita_dataset_id
+             LEFT JOIN usuarios u ON u.id = d.cliente_ref
+             ORDER BY
+               CASE p.nivel
+                 WHEN 'Alta' THEN 1
+                 WHEN 'Alta prioridad' THEN 1
+                 WHEN 'Media' THEN 2
+                 WHEN 'Prioridad media' THEN 2
+                 ELSE 3
+               END,
+               p.riesgo DESC,
+               p.fecha ASC,
+               p.hora ASC
              LIMIT 18`
         ),
     ]);
 
     const rows = predictions.rows;
-    const highRisk = rows.filter((row) => row.nivel === 'Alto').length;
-    const recoverableHours = Math.round(rows.reduce((acc, row) => acc + (row.nivel === 'Alto' ? 1.25 : 0.5), 0));
+    const normalizeRiskLabel = (nivel) => {
+        if (nivel === 'Alta prioridad') return 'Alta';
+        if (nivel === 'Prioridad media') return 'Media';
+        if (nivel === 'En observacion') return 'Baja';
+        return nivel || 'Baja';
+    };
+    const highRisk = rows.filter((row) => normalizeRiskLabel(row.nivel) === 'Alta').length;
+    const recoverableHours = Math.round(rows.reduce((acc, row) => acc + (normalizeRiskLabel(row.nivel) === 'Alta' ? 1.25 : 0.5), 0));
 
     return {
         key: 'no-show',
-        title: 'Riesgo de inasistencia',
-        subtitle: 'Citas con mayor probabilidad de cancelacion o no-show',
+        title: 'No asistencia',
+        subtitle: 'Clasificacion del riesgo de inasistencia por cita',
         metric,
         kpis: {
             citasEnRiesgo: rows.length,
             riesgoAlto: highRisk,
             horariosRecuperables: recoverableHours,
-            recordatoriosSugeridos: rows.filter((row) => row.nivel !== 'Bajo').length,
+            recordatoriosSugeridos: rows.filter((row) => normalizeRiskLabel(row.nivel) !== 'Baja').length,
         },
         citas: rows.map((row) => ({
             id: row.id,
             fecha: row.fecha,
             hora: String(row.hora).slice(0, 5),
             cliente: row.cliente_nombre,
+            telefono: row.cliente_telefono,
+            email: row.cliente_email,
             servicio: row.servicio_nombre,
             sucursal: row.local_nombre,
             riesgo: Math.round(parseNumber(row.riesgo) * 100),
-            nivel: row.nivel,
+            nivel: normalizeRiskLabel(row.nivel),
             accion: row.accion_sugerida,
         })),
         acciones: [
             'Enviar recordatorio reforzado',
-            'Llamar a clientes con riesgo alto',
+            'Llamar a clientes de alta prioridad',
             'Abrir lista de espera si no confirma',
         ],
     };
@@ -593,7 +616,7 @@ export const getKnowledgeModule = async (req, res) => {
 export const entrenarKnowledgeModels = async (req, res) => {
     try {
         const rows = Number(req.body?.rows || 1000);
-        const scriptPath = path.join(serverRoot, 'ml', 'train_knowledge_models.py');
+        const scriptPath = path.join(serverRoot, 'ml', 'entrenar_modelos_conocimiento.py');
         const child = spawn('python', [scriptPath, '--rows', String(rows)], {
             cwd: serverRoot,
             shell: process.platform === 'win32',

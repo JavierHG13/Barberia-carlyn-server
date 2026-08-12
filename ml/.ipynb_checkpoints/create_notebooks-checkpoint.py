@@ -94,19 +94,15 @@ classification_cells = [
 
 Esta libreta entrena un modelo de **clasificacion** para anticipar si una cita puede terminar como **inasistencia**.
 
-La variable objetivo se construye como una **etiqueta de riesgo de inasistencia**:
+La variable objetivo se construye asi:
 
-- `Alta`: citas que historicamente terminaron como `no_show`.
-- `Media`: citas que historicamente terminaron como `cancelada`.
-- `Baja`: citas que historicamente fueron asistidas.
+- `1`: cita con riesgo operativo, cuando el estado historico es `no_show` o `cancelada`.
+- `0`: cita asistida, cuando el estado historico es `asistio`.
 
-Se comparan varios modelos de clasificacion con validacion cruzada para elegir el de mejor desempeno:
+Se prueban dos modelos:
 
-- **LogisticRegression**: linea base interpretable.
-- **KNeighborsClassifier**: clasifica segun casos similares.
 - **DecisionTreeClassifier**: sirve como modelo base, facil de explicar.
-- **RandomForestClassifier**: combina varios arboles y suele generalizar mejor.
-- **GradientBoostingClassifier**: aprende corrigiendo errores de modelos anteriores.
+- **RandomForestClassifier**: combina varios arboles y suele generalizar mejor. Es el modelo recomendado para este modulo.
 """),
     code(COMMON_SETUP),
     md("""
@@ -120,29 +116,13 @@ df["estado_cita"].value_counts().rename_axis("estado").reset_index(name="total")
     md("""
 ## 2. Construccion de la variable objetivo
 
-Quitamos citas pendientes y creamos la columna `riesgo_inasistencia`. Esta columna es lo que el modelo intentara aprender.
-
-El problema se maneja como clasificacion multiclase:
-
-| Estado historico | Etiqueta aprendida |
-|---|---|
-| no_show | Alta |
-| cancelada | Media |
-| asistio | Baja |
+Quitamos citas pendientes y creamos la columna `target_no_show`. Esta columna es lo que el modelo intentara aprender.
 """),
     code("""
 data = df[df["estado_cita"] != "pendiente"].copy()
+data["target_no_show"] = data["estado_cita"].isin(["no_show", "cancelada"]).astype(int)
 
-label_map = {
-    "no_show": "Alta",
-    "cancelada": "Media",
-    "asistio": "Baja",
-}
-
-data["riesgo_inasistencia"] = data["estado_cita"].map(label_map)
-data = data.dropna(subset=["riesgo_inasistencia"]).copy()
-
-data[["estado_cita", "riesgo_inasistencia"]].value_counts().reset_index(name="total")
+data[["estado_cita", "target_no_show"]].value_counts().reset_index(name="total")
 """),
     md("""
 ## 3. Variables predictoras
@@ -158,13 +138,11 @@ Usamos variables que existirian antes de que ocurra la cita:
 """),
     code("""
 from sklearn.compose import ColumnTransformer
-from sklearn.model_selection import cross_validate, train_test_split
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.tree import DecisionTreeClassifier, plot_tree
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
 
 features = [
@@ -178,7 +156,7 @@ categorical = ["local_nombre", "servicio_nombre", "barbero_nombre", "canal"]
 numeric = [column for column in features if column not in categorical]
 
 X = data[features]
-y = data["riesgo_inasistencia"]
+y = data["target_no_show"]
 
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.25, random_state=42, stratify=y
@@ -190,101 +168,93 @@ preprocess = ColumnTransformer([
 ])
 """),
     md("""
-## 4. Comparacion con validacion cruzada
+## 4. Modelo base: DecisionTreeClassifier
 
-Entrenamos varios clasificadores y los comparamos con validacion cruzada. La metrica principal es `f1_weighted`, porque toma en cuenta el desbalance entre etiquetas.
+El arbol de decision es bueno para explicar reglas, pero puede sobreajustarse. Lo usamos como comparacion inicial.
 """),
     code("""
-models = {
-    "LogisticRegression": LogisticRegression(max_iter=1200, class_weight="balanced"),
-    "KNeighborsClassifier": KNeighborsClassifier(n_neighbors=9, weights="distance"),
-    "DecisionTreeClassifier": DecisionTreeClassifier(max_depth=6, min_samples_leaf=10, class_weight="balanced", random_state=42),
-    "RandomForestClassifier": RandomForestClassifier(n_estimators=160, max_depth=9, min_samples_leaf=6, class_weight="balanced", random_state=42),
-    "GradientBoostingClassifier": GradientBoostingClassifier(n_estimators=120, learning_rate=0.06, max_depth=3, random_state=42),
+decision_tree = Pipeline([
+    ("prep", preprocess),
+    ("model", DecisionTreeClassifier(max_depth=5, min_samples_leaf=12, random_state=42)),
+])
+
+decision_tree.fit(X_train, y_train)
+dt_pred = decision_tree.predict(X_test)
+
+dt_metrics = {
+    "accuracy": accuracy_score(y_test, dt_pred),
+    "precision": precision_score(y_test, dt_pred, zero_division=0),
+    "recall": recall_score(y_test, dt_pred, zero_division=0),
+    "f1": f1_score(y_test, dt_pred, zero_division=0),
 }
 
-scoring = {
-    "accuracy": "accuracy",
-    "precision": "precision_weighted",
-    "recall": "recall_weighted",
-    "f1": "f1_weighted",
-}
-
-comparison = []
-for name, estimator in models.items():
-    pipeline = Pipeline([("prep", preprocess), ("model", estimator)])
-    scores = cross_validate(pipeline, X_train, y_train, cv=5, scoring=scoring, n_jobs=None)
-    comparison.append({
-        "modelo": name,
-        "accuracy_cv": scores["test_accuracy"].mean(),
-        "precision_cv": scores["test_precision"].mean(),
-        "recall_cv": scores["test_recall"].mean(),
-        "f1_cv": scores["test_f1"].mean(),
-    })
-
-comparison_df = pd.DataFrame(comparison).sort_values("f1_cv", ascending=False)
-comparison_df
+pd.DataFrame([dt_metrics], index=["DecisionTreeClassifier"])
 """),
     md("""
-## 5. Entrenamiento del mejor clasificador
+## 5. Modelo principal: RandomForestClassifier
 
-Elegimos el modelo con mejor `f1_cv`, lo entrenamos con el conjunto de entrenamiento y lo evaluamos con datos de prueba.
+RandomForestClassifier entrena muchos arboles con muestras y variables diferentes. La prediccion final se obtiene por votacion/promedio, por eso suele ser mas estable que un solo arbol.
 """),
     code("""
-best_name = comparison_df.iloc[0]["modelo"]
-best_model = Pipeline([("prep", preprocess), ("model", models[best_name])])
-best_model.fit(X_train, y_train)
-test_pred = best_model.predict(X_test)
-test_confidence = best_model.predict_proba(X_test).max(axis=1)
+random_forest = Pipeline([
+    ("prep", preprocess),
+    ("model", RandomForestClassifier(
+        n_estimators=160,
+        max_depth=9,
+        min_samples_leaf=6,
+        class_weight="balanced",
+        random_state=42,
+    )),
+])
 
-test_metrics = {
-    "modelo": best_name,
-    "accuracy": accuracy_score(y_test, test_pred),
-    "precision": precision_score(y_test, test_pred, average="weighted", zero_division=0),
-    "recall": recall_score(y_test, test_pred, average="weighted", zero_division=0),
-    "f1": f1_score(y_test, test_pred, average="weighted", zero_division=0),
+random_forest.fit(X_train, y_train)
+rf_pred = random_forest.predict(X_test)
+rf_prob = random_forest.predict_proba(X_test)[:, 1]
+
+rf_metrics = {
+    "accuracy": accuracy_score(y_test, rf_pred),
+    "precision": precision_score(y_test, rf_pred, zero_division=0),
+    "recall": recall_score(y_test, rf_pred, zero_division=0),
+    "f1": f1_score(y_test, rf_pred, zero_division=0),
 }
 
-pd.DataFrame([test_metrics])
+pd.DataFrame([dt_metrics, rf_metrics], index=["DecisionTreeClassifier", "RandomForestClassifier"])
 """),
     md("""
 ## 6. Matriz de confusion
 
 La matriz ayuda a ver donde se equivoca el modelo:
 
-- Alta.
-- Media.
-- Baja.
+- Verdaderos negativos: citas sin riesgo correctamente detectadas.
+- Falsos positivos: citas marcadas en riesgo aunque si asistirian.
+- Falsos negativos: citas riesgosas que el modelo no detecto.
+- Verdaderos positivos: citas riesgosas detectadas.
 """),
     code("""
-labels = ["Alta", "Media", "Baja"]
-cm = confusion_matrix(y_test, test_pred, labels=labels)
-plt.figure(figsize=(7, 5))
-sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=labels, yticklabels=labels)
+cm = confusion_matrix(y_test, rf_pred)
+plt.figure(figsize=(5, 4))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=["Sin riesgo", "Riesgo"], yticklabels=["Sin riesgo", "Riesgo"])
 plt.xlabel("Prediccion")
 plt.ylabel("Real")
-plt.title(f"Matriz de confusion - {best_name}")
+plt.title("Matriz de confusion - RandomForestClassifier")
 plt.show()
 
-print(classification_report(y_test, test_pred, labels=labels, zero_division=0))
+print(classification_report(y_test, rf_pred, target_names=["Sin riesgo", "Riesgo"]))
 """),
     md("""
-## 7. Clasificacion de citas pendientes
+## 7. Citas con mayor riesgo
 
-Aplicamos el modelo a citas futuras o pendientes para obtener directamente una etiqueta de seguimiento.
+Aplicamos el modelo a citas futuras o pendientes para obtener un ranking de atencion.
 """),
     code("""
 candidates = df[df["estado_cita"] == "pendiente"].copy()
 if candidates.empty:
     candidates = df.sort_values("fecha", ascending=False).head(80).copy()
 
-candidates["riesgo_inasistencia"] = best_model.predict(candidates[features])
-candidates["confianza_modelo"] = best_model.predict_proba(candidates[features]).max(axis=1)
-prioridad = {"Alta": 3, "Media": 2, "Baja": 1}
-candidates["prioridad_orden"] = candidates["riesgo_inasistencia"].map(prioridad).fillna(0)
-top_risk = candidates.sort_values(["prioridad_orden", "confianza_modelo", "fecha", "hora"], ascending=[False, False, True, True]).head(15)
+candidates["riesgo_no_show"] = random_forest.predict_proba(candidates[features])[:, 1]
+top_risk = candidates.sort_values("riesgo_no_show", ascending=False).head(15)
 
-top_risk[["fecha", "hora", "cliente_nombre", "servicio_nombre", "local_nombre", "riesgo_inasistencia"]]
+top_risk[["fecha", "hora", "cliente_nombre", "servicio_nombre", "local_nombre", "riesgo_no_show"]]
 """),
     md("""
 ## 8. Guardado del modelo
@@ -292,8 +262,8 @@ top_risk[["fecha", "hora", "cliente_nombre", "servicio_nombre", "local_nombre", 
 Guardamos el modelo entrenado en formato `.joblib`. Este archivo se puede cargar despues para predecir sin volver a entrenar.
 """),
     code("""
-artifact_path = ARTIFACT_DIR / "notebook_clasificacion_no_asistencia.joblib"
-joblib.dump(best_model, artifact_path)
+artifact_path = ARTIFACT_DIR / "notebook_no_show_random_forest.joblib"
+joblib.dump(random_forest, artifact_path)
 artifact_path
 """),
 ]
