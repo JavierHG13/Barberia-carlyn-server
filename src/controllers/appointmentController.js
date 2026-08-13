@@ -5,13 +5,13 @@ import { query, pool } from '../config/database.js';
 // ─── Estado IDs — ajusta según tu tabla estados_cita ────────────────────────
 // Ejemplo: 1=Agendada, 2=Confirmada, 3=Completada, 4=Cancelada, 5=No_asistio
 const CANCELLED_ESTADO_ID = 4;
-const CANCELLED_ESTADO_IDS = [CANCELLED_ESTADO_ID];
 const COMPLETED_ESTADO_ID = 3;
 const NO_SHOW_ESTADO_ID = 5;
 const PENDING_ESTADO_IDS = [1, 2]; // estados "abiertos" para markNoShow
 
 const APPOINTMENT_DURATION_MINUTES = 30;
 const APPOINTMENT_BREAK_MINUTES = 10;
+const BUSINESS_TIME_ZONE = 'America/Mexico_City';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -22,6 +22,9 @@ const parsePositiveInt = (value) => {
 
 const MAX_CITAS_CLIENTE_POR_DIA = parsePositiveInt(process.env.MAX_CITAS_CLIENTE_POR_DIA) || 2;
 const MAX_CITAS_BARBERO_POR_DIA = parsePositiveInt(process.env.MAX_CITAS_BARBERO_POR_DIA);
+const MIN_BOOKING_NOTICE_MINUTES = parsePositiveInt(process.env.MIN_BOOKING_NOTICE_MINUTES) || 0;
+const CLIENT_CANCELLATION_LIMIT_MINUTES =
+  parsePositiveInt(process.env.CLIENT_CANCELLATION_LIMIT_MINUTES) || 60;
 const RELEASED_ESTADO_IDS = [CANCELLED_ESTADO_ID, NO_SHOW_ESTADO_ID];
 
 const normalizeRole = (role) => String(role || '').trim().toLowerCase();
@@ -33,6 +36,79 @@ const parseDateValue = (value) => {
   if (!value) return null;
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+const parseLocalDateValue = (value) => {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(year, month - 1, day);
+
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    return null;
+  }
+
+  return { date, dateKey: value };
+};
+
+const getBusinessNow = () => {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: BUSINESS_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date());
+
+  const values = Object.fromEntries(
+    parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value])
+  );
+  const hour = values.hour === '24' ? 0 : Number(values.hour);
+
+  return {
+    dateKey: `${values.year}-${values.month}-${values.day}`,
+    minutes: hour * 60 + Number(values.minute),
+  };
+};
+
+const getDateKeyFromDbValue = (value) => {
+  if (!value) return null;
+
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+
+  const match = String(value).match(/^\d{4}-\d{2}-\d{2}/);
+  return match ? match[0] : null;
+};
+
+const getMinutesUntilAppointment = (fecha, horaInicio) => {
+  const dateKey = getDateKeyFromDbValue(fecha);
+  const parsedTime = parseTimeValue(horaInicio);
+  if (!dateKey || !parsedTime) return null;
+
+  const businessNow = getBusinessNow();
+  const appointmentMinutes = timeToMinutes(parsedTime);
+
+  if (dateKey === businessNow.dateKey) {
+    return appointmentMinutes - businessNow.minutes;
+  }
+
+  const currentDate = parseLocalDateValue(businessNow.dateKey);
+  const appointmentDate = parseLocalDateValue(dateKey);
+  if (!currentDate || !appointmentDate) return null;
+
+  const diffDays = Math.round(
+    (appointmentDate.date.getTime() - currentDate.date.getTime()) / (24 * 60 * 60 * 1000)
+  );
+
+  return diffDays * 24 * 60 + appointmentMinutes - businessNow.minutes;
 };
 
 /**
@@ -206,7 +282,7 @@ export const createAppointment = async (req, res, next) => {
       horaInicio: parsedHoraInicio,
       horaFin: expectedHoraFin,
       breakMinutes: APPOINTMENT_BREAK_MINUTES,
-      cancelledEstadoIds: CANCELLED_ESTADO_IDS,
+      cancelledEstadoIds: RELEASED_ESTADO_IDS,
     });
 
     if (conflict) {
@@ -398,7 +474,7 @@ export const updateAppointment = async (req, res, next) => {
     const mergedStart = updates.horaInicio ?? existing.hora_inicio;
     const mergedEnd = updates.horaFin ?? existing.hora_fin;
 
-    if (!CANCELLED_ESTADO_IDS.includes(mergedEstadoId)) {
+    if (!RELEASED_ESTADO_IDS.includes(mergedEstadoId)) {
       const conflict = await Appointment.hasConflict({
         barberoId: mergedBarberoId,
         fecha: mergedFecha,
@@ -406,7 +482,7 @@ export const updateAppointment = async (req, res, next) => {
         horaFin: mergedEnd,
         breakMinutes: APPOINTMENT_BREAK_MINUTES,
         excludeId: appointmentId,
-        cancelledEstadoIds: CANCELLED_ESTADO_IDS,
+        cancelledEstadoIds: RELEASED_ESTADO_IDS,
       });
 
       if (conflict) {
@@ -449,11 +525,17 @@ export const searchAppointments = async (req, res, next) => {
     const safeLimit = Math.min(limit, 100);
     const offset = (page - 1) * safeLimit;
 
-    const fechaInicio = req.query.fechaInicio ? parseDateValue(req.query.fechaInicio) : null;
-    const fechaFin = req.query.fechaFin ? parseDateValue(req.query.fechaFin) : null;
+    const fechaInicioParsed = req.query.fechaInicio ? parseLocalDateValue(req.query.fechaInicio) : null;
+    const fechaFinParsed = req.query.fechaFin ? parseLocalDateValue(req.query.fechaFin) : null;
 
-    if (req.query.fechaInicio && !fechaInicio) return res.status(400).json({ message: 'fechaInicio inválida' });
-    if (req.query.fechaFin && !fechaFin) return res.status(400).json({ message: 'fechaFin inválida' });
+    if (req.query.fechaInicio && !fechaInicioParsed) return res.status(400).json({ message: 'fechaInicio inválida' });
+    if (req.query.fechaFin && !fechaFinParsed) return res.status(400).json({ message: 'fechaFin inválida' });
+
+    // Se pasa la fecha como texto 'YYYY-MM-DD' (no como Date) para evitar que
+    // el driver de pg la reinterprete en la zona horaria local del servidor y
+    // termine excluyendo el día actual (ver parseDateValue vs parseLocalDateValue).
+    const fechaInicio = fechaInicioParsed ? fechaInicioParsed.dateKey : null;
+    const fechaFin = fechaFinParsed ? fechaFinParsed.dateKey : null;
 
     const estadoId = req.query.estadoId ? parsePositiveInt(req.query.estadoId) : null;
     const barberoId = req.query.barberoId ? parsePositiveInt(req.query.barberoId) : null;
@@ -684,6 +766,22 @@ export const cancelAppointment = async (req, res, next) => {
       return res.status(400).json({ message: 'No se puede cancelar una cita completada' });
     }
 
+    if (normalizeRole(req.user.rol) === 'cliente') {
+      const minutesUntilStart = getMinutesUntilAppointment(existing.fecha, existing.hora_inicio);
+
+      if (minutesUntilStart !== null && minutesUntilStart <= CLIENT_CANCELLATION_LIMIT_MINUTES) {
+        const message = minutesUntilStart < 0
+          ? 'Esta cita ya inició o ya pasó. Solicita apoyo a la barbería para actualizarla.'
+          : `No puedes cancelar desde el sitio cuando falta ${CLIENT_CANCELLATION_LIMIT_MINUTES} minuto(s) o menos para tu cita. Contacta a la barbería para revisar tu caso.`;
+
+        return res.status(409).json({
+          message,
+          code: 'CANCELLATION_WINDOW_CLOSED',
+          minutesUntilStart,
+        });
+      }
+    }
+
     const motivo = typeof req.body.motivo === 'string' ? req.body.motivo.trim() : null;
     const cita = await Appointment.cancel(appointmentId, motivo, CANCELLED_ESTADO_ID);
 
@@ -772,7 +870,21 @@ export const getAvailableSlots = async (req, res, next) => {
       return res.status(400).json({ message: 'barberoId y fecha son requeridos' });
     }
 
-    const diaSemana = new Date(fecha).getDay();
+    const parsedFecha = parseLocalDateValue(fecha);
+    if (!parsedFecha) {
+      return res.status(400).json({ message: 'fecha inválida' });
+    }
+
+    const businessNow = getBusinessNow();
+    if (parsedFecha.dateKey < businessNow.dateKey) {
+      return res.json({ disponibles: [], libres: [], slots: [] });
+    }
+
+    const diaSemana = parsedFecha.date.getDay();
+    const minStartForToday =
+      parsedFecha.dateKey === businessNow.dateKey
+        ? businessNow.minutes + MIN_BOOKING_NOTICE_MINUTES
+        : null;
 
     // 1. Obtener horario del barbero para ese día
     const horarioResult = await pool.query(
@@ -821,31 +933,38 @@ export const getAvailableSlots = async (req, res, next) => {
     for (let current = startMinutes; current + SLOT_DURATION <= endMinutes; current += SLOT_INTERVAL) {
       const slotStart = current;
       const slotEnd = current + SLOT_DURATION;
+      const hora = minutesToTime(slotStart);
+
+      const estaPasado = minStartForToday !== null && slotStart <= minStartForToday;
 
       // Verificar si el slot está ocupado por alguna cita existente
       let estaOcupado = false;
-      for (const occupied of occupiedSlots) {
-        // Hay superposición si el slot y la cita se cruzan
-        if (slotStart < occupied.end && slotEnd > occupied.start) {
-          estaOcupado = true;
-          break;
+      if (!estaPasado) {
+        for (const occupied of occupiedSlots) {
+          // Hay superposición si el slot y la cita se cruzan
+          if (slotStart < occupied.end && slotEnd > occupied.start) {
+            estaOcupado = true;
+            break;
+          }
         }
       }
 
       const slot = {
-        hora: minutesToTime(slotStart),
-        disponible: !estaOcupado,
+        hora,
+        disponible: !estaOcupado && !estaPasado,
         ocupado: estaOcupado,
+        pasado: estaPasado,
+        motivo: estaPasado ? 'Horario pasado' : estaOcupado ? 'Horario reservado' : null,
       };
 
       slots.push(slot);
 
-      if (!estaOcupado) {
+      if (slot.disponible) {
         disponibles.push(slot);
       }
     }
 
-    res.json({ disponibles: slots, libres: disponibles });
+    res.json({ disponibles, libres: disponibles, slots });
   } catch (error) {
     console.error('Error en getAvailableSlots:', error);
     next(error);

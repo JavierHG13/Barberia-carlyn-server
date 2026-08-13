@@ -4,13 +4,53 @@ import AlexaLink from '../models/alexaLink.model.js';
 import { pool, query } from '../config/database.js';
 import emailService from '../utils/emailService.js';
 
-const CANCELLED_ESTADO_IDS = [4];
 const APPOINTMENT_DURATION_MINUTES = 30;
 const APPOINTMENT_BREAK_MINUTES = 10;
+const BUSINESS_TIME_ZONE = 'America/Mexico_City';
+const RELEASED_ESTADO_IDS = [4, 5];
 
 const parsePositiveInt = (value) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isNaN(parsed) || parsed <= 0 ? null : parsed;
+};
+
+const parseLocalDateValue = (value) => {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(year, month - 1, day);
+
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    return null;
+  }
+
+  return { date, dateKey: value };
+};
+
+const getBusinessNow = () => {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: BUSINESS_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date());
+
+  const values = Object.fromEntries(
+    parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value])
+  );
+  const hour = values.hour === '24' ? 0 : Number(values.hour);
+
+  return {
+    dateKey: `${values.year}-${values.month}-${values.day}`,
+    minutes: hour * 60 + Number(values.minute),
+  };
 };
 
 const parseTimeValue = (value) => {
@@ -139,7 +179,7 @@ export const createSkillAppointment = async (req, res, next) => {
 
     if (!barberoId) return res.status(400).json({ message: 'barberoId inválido' });
     if (!servicioId) return res.status(400).json({ message: 'servicioId inválido' });
-    if (!fecha || Number.isNaN(new Date(fecha).getTime())) return res.status(400).json({ message: 'fecha inválida' });
+    if (!parseLocalDateValue(fecha)) return res.status(400).json({ message: 'fecha inválida' });
     if (!horaInicio) return res.status(400).json({ message: 'horaInicio inválida' });
 
     const barbero = await BarberoModel.getById(barberoId);
@@ -157,7 +197,7 @@ export const createSkillAppointment = async (req, res, next) => {
       horaInicio,
       horaFin,
       breakMinutes: APPOINTMENT_BREAK_MINUTES,
-      cancelledEstadoIds: CANCELLED_ESTADO_IDS,
+      cancelledEstadoIds: RELEASED_ESTADO_IDS,
     });
 
     if (conflict) {
@@ -249,7 +289,14 @@ export const getSkillAvailableSlots = async (req, res, next) => {
     const { barberoId, fecha } = req.query;
     if (!barberoId || !fecha) return res.status(400).json({ message: 'barberoId y fecha son requeridos' });
 
-    const diaSemana = new Date(fecha).getDay();
+    const parsedFecha = parseLocalDateValue(fecha);
+    if (!parsedFecha) return res.status(400).json({ message: 'fecha inválida' });
+
+    const businessNow = getBusinessNow();
+    if (parsedFecha.dateKey < businessNow.dateKey) return res.json({ disponibles: [] });
+
+    const diaSemana = parsedFecha.date.getDay();
+    const minStartForToday = parsedFecha.dateKey === businessNow.dateKey ? businessNow.minutes : null;
     const horarioResult = await pool.query(
       `SELECT hora_inicio, hora_fin
        FROM horarios_barbero
@@ -292,6 +339,8 @@ export const getSkillAvailableSlots = async (req, res, next) => {
       current += APPOINTMENT_DURATION_MINUTES + APPOINTMENT_BREAK_MINUTES
     ) {
       const slotEnd = current + APPOINTMENT_DURATION_MINUTES;
+      if (minStartForToday !== null && current <= minStartForToday) continue;
+
       const ocupado = occupiedSlots.some((occupied) => current < occupied.end && slotEnd > occupied.start);
       if (!ocupado) disponibles.push({ hora: minutesToTime(current), disponible: true });
     }

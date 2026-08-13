@@ -2,7 +2,7 @@ import { pool } from '../config/database.js';
 
 const APPOINTMENT_SELECT = `
   c.id,
-  c.fecha,
+  TO_CHAR(c.fecha, 'YYYY-MM-DD') AS fecha,
   c.hora_inicio,
   c.hora_fin,
   c.notas,
