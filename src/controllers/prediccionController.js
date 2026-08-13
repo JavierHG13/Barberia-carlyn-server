@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const serverRoot = path.resolve(__dirname, '..', '..');
+const currentModelVersion = 'mes3-final-v2';
 
 /**
  * Calcula la predicción de citas usando modelo exponencial dx/dt = kx
@@ -398,7 +399,15 @@ const getMetric = async (modelKey) => {
          LIMIT 1`,
         [modelKey]
     );
-    return result.rows[0] || null;
+    const row = result.rows[0] || null;
+    if (!row) return null;
+    const metrics = typeof row.metrics === 'string' ? JSON.parse(row.metrics) : row.metrics;
+    return {
+        ...row,
+        metrics,
+        is_current: metrics?.model_version === currentModelVersion,
+        expected_version: currentModelVersion,
+    };
 };
 
 const ensureKnowledgeReady = async () => {
@@ -540,14 +549,14 @@ const getSegmentacionModule = async () => {
             `SELECT segmento, color, COUNT(*)::int AS total,
                     AVG(gasto_total)::numeric(10,2) AS gasto_promedio,
                     AVG(recencia_dias)::numeric(10,2) AS recencia_promedio,
-                    AVG(no_show_rate)::numeric(10,4) AS no_show_promedio
+                    AVG(frecuencia_90d)::numeric(10,2) AS frecuencia_promedio
              FROM analitica.ml_cliente_segments
              GROUP BY segmento, color
              ORDER BY total DESC`
         ),
         query(
             `SELECT cliente_ref, cliente_nombre, segmento, frecuencia_90d, recencia_dias,
-                    gasto_total, no_show_rate, accion, color
+                    gasto_total, accion, color
              FROM analitica.ml_cliente_segments
              ORDER BY gasto_total DESC, frecuencia_90d DESC
              LIMIT 18`
@@ -565,7 +574,7 @@ const getSegmentacionModule = async () => {
             total: row.total,
             gastoPromedio: Math.round(parseNumber(row.gasto_promedio)),
             recenciaPromedio: Math.round(parseNumber(row.recencia_promedio)),
-            noShowPromedio: Math.round(parseNumber(row.no_show_promedio) * 100),
+            frecuenciaPromedio: Number(parseNumber(row.frecuencia_promedio).toFixed(1)),
         })),
         clientes: clients.rows.map((row) => ({
             clienteRef: row.cliente_ref,
@@ -574,19 +583,16 @@ const getSegmentacionModule = async () => {
             frecuencia: row.frecuencia_90d,
             recencia: row.recencia_dias,
             gasto: Math.round(parseNumber(row.gasto_total)),
-            noShow: Math.round(parseNumber(row.no_show_rate) * 100),
             accion: row.accion,
             color: row.color,
         })),
         campanas: summary.rows.map((row) => ({
             segmento: row.segmento,
-            texto: row.segmento === 'VIP frecuentes'
-                ? 'Acceso anticipado a paquetes premium.'
+            texto: row.segmento === 'Clientes VIP'
+                ? 'Paquete premium, beneficios exclusivos y prioridad de agenda.'
                 : row.segmento === 'Riesgo de fuga'
                     ? 'Promocion de regreso con vigencia corta.'
-                    : row.segmento === 'Nuevos/prueba'
-                        ? 'Mensaje post-servicio y recomendacion de proxima visita.'
-                        : 'Recordatorio automatico para mantener frecuencia.',
+                    : 'Programa de lealtad y recordatorio de proxima visita.',
         })),
     };
 };
@@ -615,9 +621,8 @@ export const getKnowledgeModule = async (req, res) => {
 
 export const entrenarKnowledgeModels = async (req, res) => {
     try {
-        const rows = Number(req.body?.rows || 1000);
         const scriptPath = path.join(serverRoot, 'ml', 'entrenar_modelos_conocimiento.py');
-        const child = spawn('python', [scriptPath, '--rows', String(rows)], {
+        const child = spawn('python', [scriptPath, '--train-only'], {
             cwd: serverRoot,
             shell: process.platform === 'win32',
         });
@@ -631,7 +636,11 @@ export const entrenarKnowledgeModels = async (req, res) => {
             if (code !== 0) {
                 return res.status(500).json({ error: 'Error entrenando modelos', details: stderr || stdout });
             }
-            return res.json({ ok: true, output: stdout.trim().split(/\r?\n/).filter(Boolean) });
+            return res.json({
+                ok: true,
+                modelVersion: currentModelVersion,
+                output: stdout.trim().split(/\r?\n/).filter(Boolean),
+            });
         });
     } catch (error) {
         console.error('Error lanzando entrenamiento:', error);

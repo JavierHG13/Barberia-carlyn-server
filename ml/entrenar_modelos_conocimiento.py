@@ -16,10 +16,25 @@ from sklearn.base import clone
 from sklearn.cluster import KMeans
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, RandomForestRegressor
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, precision_score, r2_score, recall_score
-from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    calinski_harabasz_score,
+    confusion_matrix,
+    davies_bouldin_score,
+    f1_score,
+    mean_absolute_error,
+    precision_recall_curve,
+    precision_score,
+    r2_score,
+    recall_score,
+    roc_auc_score,
+    silhouette_score,
+)
+from sklearn.mixture import GaussianMixture
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, cross_validate, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.tree import DecisionTreeClassifier
@@ -27,6 +42,7 @@ from sklearn.tree import DecisionTreeClassifier
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_DIR = ROOT / "ml" / "artifacts"
+MODEL_VERSION = "mes3-final-v2"
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -324,13 +340,7 @@ def save_metric(conn, model_key, model_name, algorithm, samples, metrics, artifa
 
 def train_no_show(conn, df):
     train_df = df[df["estado_cita"] != "pendiente"].copy()
-    label_map = {
-        "no_show": "Alta",
-        "cancelada": "Media",
-        "asistio": "Baja",
-    }
-    train_df["target"] = train_df["estado_cita"].map(label_map)
-    train_df = train_df.dropna(subset=["target"]).copy()
+    train_df["target"] = (train_df["estado_cita"] == "no_show").astype(int)
     features = [
         "local_nombre", "servicio_nombre", "barbero_nombre", "dia_semana", "semana", "precio",
         "duracion", "recordatorio_enviado", "frecuencia_cliente", "recencia_dias",
@@ -348,22 +358,29 @@ def train_no_show(conn, df):
     )
 
     preprocess = ColumnTransformer([
-        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical),
-        ("num", StandardScaler(), numeric),
+        ("cat", Pipeline([
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ]), categorical),
+        ("num", Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]), numeric),
     ])
 
     candidates = {
-        "LogisticRegression": LogisticRegression(max_iter=1200, class_weight="balanced"),
-        "KNeighborsClassifier": KNeighborsClassifier(n_neighbors=9),
-        "DecisionTreeClassifier": DecisionTreeClassifier(max_depth=6, min_samples_leaf=10, class_weight="balanced", random_state=42),
-        "RandomForestClassifier": RandomForestClassifier(n_estimators=160, max_depth=9, min_samples_leaf=6, class_weight="balanced", random_state=42),
-        "GradientBoostingClassifier": GradientBoostingClassifier(n_estimators=120, learning_rate=0.06, max_depth=3, random_state=42),
+        "Gradient Boosting": GradientBoostingClassifier(n_estimators=120, learning_rate=0.06, max_depth=3, random_state=42),
+        "Random Forest": RandomForestClassifier(n_estimators=160, max_depth=9, min_samples_leaf=6, class_weight="balanced", random_state=42),
+        "Arbol de Decision": DecisionTreeClassifier(max_depth=6, min_samples_leaf=10, class_weight="balanced", random_state=42),
+        "Regresion Logistica": LogisticRegression(max_iter=1200, class_weight="balanced", random_state=42),
     }
     scoring = {
         "accuracy": "accuracy",
-        "precision": "precision_weighted",
-        "recall": "recall_weighted",
-        "f1": "f1_weighted",
+        "balanced_accuracy": "balanced_accuracy",
+        "precision": "precision",
+        "recall": "recall",
+        "f1": "f1",
+        "roc_auc": "roc_auc",
     }
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     model_comparison = []
@@ -382,33 +399,68 @@ def train_no_show(conn, df):
             "model": name,
             "accuracy_mean": round(float(scores["test_accuracy"].mean()), 4),
             "accuracy_std": round(float(scores["test_accuracy"].std()), 4),
+            "balanced_accuracy_mean": round(float(scores["test_balanced_accuracy"].mean()), 4),
             "precision_mean": round(float(scores["test_precision"].mean()), 4),
             "recall_mean": round(float(scores["test_recall"].mean()), 4),
             "f1_mean": round(float(scores["test_f1"].mean()), 4),
+            "roc_auc_mean": round(float(scores["test_roc_auc"].mean()), 4),
         })
 
-    best = max(model_comparison, key=lambda item: (item["f1_mean"], item["accuracy_mean"]))
-    model = Pipeline([("prep", clone(preprocess)), ("model", candidates[best["model"]])])
-    model.fit(x_train, y_train)
-    pred = model.predict(x_test)
-    probabilities = model.predict_proba(x_test).max(axis=1)
-    artifact = ARTIFACT_DIR / "no_show_classifier.joblib"
-    joblib.dump(model, artifact)
+    # Gradient Boosting se conserva como modelo final por el requisito del proyecto.
+    # El umbral operativo se calibra con predicciones out-of-fold para no usar el test.
+    selected_name = "Gradient Boosting"
+    model = Pipeline([("prep", clone(preprocess)), ("model", candidates[selected_name])])
+    oof_probability = cross_val_predict(
+        model,
+        x_train,
+        y_train,
+        cv=cv,
+        method="predict_proba",
+    )[:, 1]
+    threshold_precision, threshold_recall, thresholds = precision_recall_curve(y_train, oof_probability)
+    beta_squared = 4.0
+    f2_scores = (
+        (1 + beta_squared) * threshold_precision[:-1] * threshold_recall[:-1]
+        / np.maximum(beta_squared * threshold_precision[:-1] + threshold_recall[:-1], 1e-12)
+    )
+    decision_threshold = float(thresholds[int(np.nanargmax(f2_scores))]) if len(thresholds) else 0.5
+    low_max, medium_max = np.quantile(oof_probability, [1 / 3, 2 / 3])
 
-    candidates = df[df["fecha"] >= date.today()].copy()
-    if len(candidates) < 10:
-        candidates = df.sort_values("fecha", ascending=False).head(60).copy()
-    candidates["nivel"] = model.predict(candidates[features])
-    candidates["confianza"] = model.predict_proba(candidates[features]).max(axis=1)
+    model.fit(x_train, y_train)
+    probabilities = model.predict_proba(x_test)[:, 1]
+    pred = (probabilities >= decision_threshold).astype(int)
+    artifact = ARTIFACT_DIR / "no_show_classifier.joblib"
+    joblib.dump({
+        "pipeline": model,
+        "features": features,
+        "threshold": decision_threshold,
+        "risk_thresholds": {"low_max": float(low_max), "medium_max": float(medium_max)},
+        "selected_by": "requisito_gradient_boosting_umbral_f2_oof",
+        "null_treatment": {"categorical": "most_frequent", "numeric": "median"},
+    }, artifact)
+
+    appointments = df[df["fecha"] >= date.today()].copy()
+    if len(appointments) < 10:
+        appointments = df.sort_values("fecha", ascending=False).head(60).copy()
+    appointments["riesgo"] = model.predict_proba(appointments[features])[:, 1]
+    appointments["nivel"] = np.select(
+        [appointments["riesgo"] <= low_max, appointments["riesgo"] <= medium_max],
+        ["Baja", "Media"],
+        default="Alta",
+    )
     priority_order = {"Alta": 3, "Media": 2, "Baja": 1}
-    candidates["prioridad_orden"] = candidates["nivel"].map(priority_order).fillna(0)
-    top = candidates.sort_values(["prioridad_orden", "confianza", "fecha", "hora"], ascending=[False, False, True, True]).head(18)
+    appointments["prioridad_orden"] = appointments["nivel"].map(priority_order)
+    top = appointments.sort_values(["prioridad_orden", "riesgo", "fecha", "hora"], ascending=[False, False, True, True]).head(18)
 
     rows = []
     for item in top.itertuples():
-        confianza = float(item.confianza)
+        riesgo = float(item.riesgo)
         nivel = item.nivel
-        accion = "Llamar y enviar recordatorio reforzado" if nivel == "Alta" else "Enviar WhatsApp de confirmacion"
+        accion = (
+            "Llamar y enviar recordatorio reforzado"
+            if nivel == "Alta"
+            else "Enviar WhatsApp de confirmacion" if nivel == "Media" else "Mantener recordatorio automatico"
+        )
         rows.append(
             (
                 int(item.id),
@@ -417,7 +469,7 @@ def train_no_show(conn, df):
                 item.cliente_nombre,
                 item.servicio_nombre,
                 item.local_nombre,
-                round(confianza, 4),
+                round(riesgo, 4),
                 nivel,
                 accion,
             )
@@ -438,16 +490,24 @@ def train_no_show(conn, df):
         conn,
         "no-show",
         "Riesgo de inasistencia",
-        best["model"],
+        selected_name,
         len(train_df),
         {
+            "model_version": MODEL_VERSION,
             "accuracy": round(float(accuracy_score(y_test, pred)), 4),
-            "precision": round(float(precision_score(y_test, pred, average="weighted", zero_division=0)), 4),
-            "recall": round(float(recall_score(y_test, pred, average="weighted", zero_division=0)), 4),
-            "f1": round(float(f1_score(y_test, pred, average="weighted", zero_division=0)), 4),
-            "confidence_mean": round(float(np.mean(probabilities)), 4),
-            "selection_metric": "f1_mean, tie_breaker accuracy_mean",
+            "balanced_accuracy": round(float(balanced_accuracy_score(y_test, pred)), 4),
+            "precision": round(float(precision_score(y_test, pred, zero_division=0)), 4),
+            "recall": round(float(recall_score(y_test, pred, zero_division=0)), 4),
+            "f1": round(float(f1_score(y_test, pred, zero_division=0)), 4),
+            "roc_auc": round(float(roc_auc_score(y_test, probabilities)), 4),
+            "confusion_matrix": confusion_matrix(y_test, pred).tolist(),
+            "binary_threshold": round(decision_threshold, 6),
+            "risk_thresholds": {"low_max": round(float(low_max), 6), "medium_max": round(float(medium_max), 6)},
+            "selection_metric": "Gradient Boosting por requisito; umbral calibrado maximizando F2 con predicciones out-of-fold",
             "classes": ["Alta", "Media", "Baja"],
+            "target": "inasistencia binaria: no_show=1; otros estados concluidos=0",
+            "null_treatment": {"categorical": "most_frequent", "numeric": "median"},
+            "cross_validation_folds": 5,
             "cross_validation": model_comparison,
         },
         artifact,
@@ -529,13 +589,12 @@ def train_segments(conn, df):
             frecuencia_90d=("frecuencia_cliente", "max"),
             recencia_dias=("recencia_dias", "min"),
             gasto_total=("gasto_total_cliente", "max"),
-            no_show_rate=("no_show_rate_cliente", "max"),
         )
     )
-    features = ["frecuencia_90d", "recencia_dias", "gasto_total", "no_show_rate"]
+    features = ["frecuencia_90d", "recencia_dias", "gasto_total"]
     scaler = StandardScaler()
     x = scaler.fit_transform(clients[features])
-    kmeans = KMeans(n_clusters=4, random_state=42, n_init=12)
+    kmeans = KMeans(n_clusters=3, random_state=42, n_init=20)
     clients["cluster"] = kmeans.fit_predict(x)
 
     cluster_stats = clients.groupby("cluster")[features].mean()
@@ -543,24 +602,47 @@ def train_segments(conn, df):
     used = set()
 
     vip = cluster_stats.sort_values(["gasto_total", "frecuencia_90d"], ascending=False).index[0]
-    labels[vip] = ("VIP frecuentes", "Beneficio premium", "#16A34A")
+    labels[vip] = ("Clientes VIP", "Paquete premium y prioridad de agenda", "#16A34A")
     used.add(vip)
 
-    risk = cluster_stats.drop(index=list(used)).sort_values(["recencia_dias", "no_show_rate"], ascending=False).index[0]
-    labels[risk] = ("Riesgo de fuga", "Promocion de regreso", "#DC2626")
+    risk = cluster_stats.drop(index=list(used)).sort_values("recencia_dias", ascending=False).index[0]
+    labels[risk] = ("Riesgo de fuga", "Campana de regreso con vigencia corta", "#DC2626")
     used.add(risk)
-
-    new = cluster_stats.drop(index=list(used)).sort_values("frecuencia_90d", ascending=True).index[0]
-    labels[new] = ("Nuevos/prueba", "Seguimiento post-servicio", "#D97706")
-    used.add(new)
 
     for cluster in cluster_stats.index:
         if cluster not in labels:
-            labels[cluster] = ("Ocasionales", "Recordatorio de proxima visita", "#0EA5E9")
+            labels[cluster] = ("Clientes frecuentes", "Programa de lealtad y recordatorio de proxima visita", "#0EA5E9")
 
     clients[["segmento", "accion", "color"]] = clients["cluster"].apply(lambda c: pd.Series(labels[c]))
     artifact = ARTIFACT_DIR / "client_segmentation.joblib"
-    joblib.dump({"scaler": scaler, "model": kmeans, "labels": labels}, artifact)
+    joblib.dump({
+        "scaler": scaler,
+        "model": kmeans,
+        "model_name": "K-Means",
+        "k": 3,
+        "features": features,
+        "labels": {int(cluster): values[0] for cluster, values in labels.items()},
+        "actions": {values[0]: values[1] for values in labels.values()},
+    }, artifact)
+
+    gaussian = GaussianMixture(n_components=3, covariance_type="full", random_state=42, n_init=5)
+    gaussian_labels = gaussian.fit_predict(x)
+    comparison = [
+        {
+            "model": "K-Means",
+            "silhouette": round(float(silhouette_score(x, clients["cluster"])), 4),
+            "davies_bouldin": round(float(davies_bouldin_score(x, clients["cluster"])), 4),
+            "calinski_harabasz": round(float(calinski_harabasz_score(x, clients["cluster"])), 4),
+        },
+        {
+            "model": "Gaussian Mixture",
+            "silhouette": round(float(silhouette_score(x, gaussian_labels)), 4),
+            "davies_bouldin": round(float(davies_bouldin_score(x, gaussian_labels)), 4),
+            "calinski_harabasz": round(float(calinski_harabasz_score(x, gaussian_labels)), 4),
+            "bic": round(float(gaussian.bic(x)), 2),
+            "aic": round(float(gaussian.aic(x)), 2),
+        },
+    ]
 
     rows = [
         (
@@ -570,7 +652,7 @@ def train_segments(conn, df):
             int(row.frecuencia_90d),
             int(row.recencia_dias),
             round(float(row.gasto_total), 2),
-            round(float(row.no_show_rate), 4),
+            0.0,  # Columna heredada; ya no participa en el modelo ni en la vista.
             row.accion,
             row.color,
         )
@@ -593,9 +675,17 @@ def train_segments(conn, df):
         conn,
         "segmentacion",
         "Segmentacion de clientes",
-        "KMeans",
+        "K-Means",
         len(clients),
-        {"clusters": 4, "segment_counts": counts},
+        {
+            "model_version": MODEL_VERSION,
+            "clusters": 3,
+            "scaler": "StandardScaler",
+            "features": features,
+            "segment_counts": counts,
+            "selection_criterion": "k=3 por requerimiento de negocio; comparacion con Silhouette, Davies-Bouldin y Calinski-Harabasz",
+            "comparison": comparison,
+        },
         artifact,
     )
 

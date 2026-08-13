@@ -11,7 +11,8 @@
     "ml:retrain": "python ml/entrenar_modelos_conocimiento.py --train-only",
     "ml:evidence": "node scripts/materialize-ml-evidence.js",
     "ml:evidence:reset": "node scripts/materialize-ml-evidence.js --reset",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "verify:models": "node --check src/controllers/prediccionController.js && node --check src/routes/prediccion.routes.js && python -m py_compile ml/entrenar_modelos_conocimiento.py",
+    "test": "npm run verify:models"
   },
   "keywords": [],
   "author": "",
